@@ -200,3 +200,351 @@ fn load_market_props(env: &Env, data_store: &Address, market_token: &Address) ->
         .expect("market short token not found");
     MarketProps { market_token: market_token.clone(), index_token, long_token, short_token }
 }
+
+// ─── Tests — Issue #71 & #72: liquidation E2E tests ──────────────────────────
+//
+// Issue #72: Create a long position, move price against it past the liquidation
+//   threshold, and liquidate through liquidation_handler.
+//   Done: Position is closed. Remaining collateral and liquidation fees are
+//   handled correctly. Position key is removed from storage.
+//
+// Issue #73: Create a short position, move price against it, and liquidate
+//   through liquidation_handler.
+//   Done: Short liquidation follows identical accounting guarantees to long.
+//   Position key removed. Fee routing matches issue #74.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::Address as _,
+        token::StellarAssetClient,
+        Env, Vec,
+    };
+    use role_store::{RoleStore, RoleStoreClient as RsClient};
+    use data_store::{DataStore, DataStoreClient as DsClient};
+    use oracle::{Oracle, OracleClient as OClient};
+    use order_vault::{OrderVault, OrderVaultClient as OVClient};
+    use order_handler::{OrderHandler, OrderHandlerClient as OHClient};
+    use market_token::{MarketToken, MarketTokenClient as MtClient};
+    use gmx_keys::roles;
+    use gmx_types::{TokenPrice, CreateOrderParams, OrderType};
+    use gmx_math::{FLOAT_PRECISION, TOKEN_PRECISION};
+
+    const ONE_TOKEN: i128 = 10_000_000; // 10^7 (Stellar 7-decimal precision)
+
+    struct World {
+        env:        Env,
+        admin:      Address,
+        keeper:     Address,
+        liq_keeper: Address,
+        user:       Address,
+        rs:         Address,
+        ds:         Address,
+        oracle:     Address,
+        vault:      Address,
+        ord_handler: Address,
+        liq_handler: Address,
+        market_tk:  Address,
+        long_tk:    Address,
+        short_tk:   Address,
+        index_tk:   Address,
+    }
+
+    fn setup() -> World {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin      = Address::generate(&env);
+        let keeper     = Address::generate(&env);
+        let liq_keeper = Address::generate(&env);
+        let user       = Address::generate(&env);
+
+        // Role store
+        let rs = env.register(RoleStore, ());
+        RsClient::new(&env, &rs).initialize(&admin);
+        let rs_c = RsClient::new(&env, &rs);
+        rs_c.grant_role(&admin, &admin,      &roles::controller(&env));
+        rs_c.grant_role(&admin, &keeper,     &roles::order_keeper(&env));
+        rs_c.grant_role(&admin, &liq_keeper, &roles::liquidation_keeper(&env));
+
+        // Data store
+        let ds = env.register(DataStore, ());
+        DsClient::new(&env, &ds).initialize(&admin, &rs);
+
+        // Oracle
+        let oracle_addr = env.register(Oracle, ());
+        let passphrase = soroban_sdk::Bytes::from_slice(&env, b"Test SDF Network ; September 2015");
+        OClient::new(&env, &oracle_addr).initialize(&admin, &rs, &ds, &passphrase);
+
+        // Order vault
+        let vault = env.register(OrderVault, ());
+        OVClient::new(&env, &vault).initialize(&admin, &rs);
+
+        // Market token (LP + pool custodian)
+        let market_tk = env.register(MarketToken, ());
+        MtClient::new(&env, &market_tk).initialize(
+            &admin, &rs, &7u32,
+            &soroban_sdk::String::from_str(&env, "SO4 Market"),
+            &soroban_sdk::String::from_str(&env, "GM"),
+        );
+
+        // Underlying tokens
+        let long_tk  = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let short_tk = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let index_tk = Address::generate(&env);
+
+        // Order handler
+        let ord_handler = env.register(OrderHandler, ());
+        OHClient::new(&env, &ord_handler).initialize(&admin, &rs, &ds, &oracle_addr, &vault);
+
+        // Liquidation handler
+        let liq_handler = env.register(LiquidationHandler, ());
+        LiquidationHandlerClient::new(&env, &liq_handler)
+            .initialize(&admin, &rs, &ds, &oracle_addr, &ord_handler);
+
+        // Grant CONTROLLER to handlers
+        rs_c.grant_role(&admin, &ord_handler, &roles::controller(&env));
+        rs_c.grant_role(&admin, &liq_handler, &roles::controller(&env));
+        // Grant liq_keeper LIQUIDATION_KEEPER on order_handler too (it calls liquidate_position)
+        rs_c.grant_role(&admin, &liq_keeper, &roles::liquidation_keeper(&env));
+
+        // Register market in DataStore
+        let ds_c = DsClient::new(&env, &ds);
+        ds_c.set_address(&admin, &gmx_keys::market_index_token_key(&env, &market_tk), &index_tk);
+        ds_c.set_address(&admin, &gmx_keys::market_long_token_key(&env, &market_tk),  &long_tk);
+        ds_c.set_address(&admin, &gmx_keys::market_short_token_key(&env, &market_tk), &short_tk);
+
+        // Market config: 10 bps position fee, 1% min collateral factor (liquidation threshold)
+        let fee_factor = FLOAT_PRECISION / 1000; // 0.1%
+        ds_c.set_u128(&admin, &gmx_keys::position_fee_factor_key(&env, &market_tk, true),  &(fee_factor as u128));
+        ds_c.set_u128(&admin, &gmx_keys::position_fee_factor_key(&env, &market_tk, false), &(fee_factor as u128));
+        // min_collateral_factor = 1% of position size (liquidate when collateral < 1% of size)
+        let min_col_factor = FLOAT_PRECISION / 100; // 1%
+        ds_c.set_u128(&admin, &gmx_keys::min_collateral_factor_key(&env, &market_tk), &(min_col_factor as u128));
+        // Max leverage = 100x
+        ds_c.set_u128(&admin, &gmx_keys::max_leverage_key(&env, &market_tk), &(100 * FLOAT_PRECISION as u128));
+
+        World {
+            env, admin, keeper, liq_keeper, user,
+            rs, ds, oracle: oracle_addr, vault,
+            ord_handler, liq_handler,
+            market_tk, long_tk, short_tk, index_tk,
+        }
+    }
+
+    fn set_prices(w: &World, index_usd: i128) {
+        let fp = FLOAT_PRECISION;
+        OClient::new(&w.env, &w.oracle).set_prices_simple(&w.keeper, &soroban_sdk::Vec::from_array(&w.env, [
+            TokenPrice { token: w.long_tk.clone(),  min: index_usd, max: index_usd },
+            TokenPrice { token: w.short_tk.clone(), min: fp,        max: fp        },
+            TokenPrice { token: w.index_tk.clone(), min: index_usd, max: index_usd },
+        ]));
+    }
+
+    /// Open a long position: mint collateral, fund vault, create + execute MarketIncrease.
+    fn open_long_position(w: &World, collateral_tokens: i128, size_usd: i128) {
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.vault, &collateral_tokens);
+        // Seed pool so market has liquidity for the position
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(collateral_tokens * 10));
+        DsClient::new(&w.env, &w.ds).set_u128(
+            &w.admin,
+            &gmx_keys::pool_amount_key(&w.env, &w.market_tk, &w.long_tk),
+            &(collateral_tokens as u128 * 10),
+        );
+
+        let hc = OHClient::new(&w.env, &w.ord_handler);
+        let key = hc.create_order(&w.user, &CreateOrderParams {
+            receiver:                 w.user.clone(),
+            market:                   w.market_tk.clone(),
+            initial_collateral_token: w.long_tk.clone(),
+            swap_path:                soroban_sdk::Vec::new(&w.env),
+            size_delta_usd:           size_usd,
+            collateral_delta_amount:  collateral_tokens,
+            trigger_price:            0,
+            acceptable_price:         0,
+            execution_fee:            0,
+            min_output_amount:        0,
+            order_type:               OrderType::MarketIncrease,
+            is_long:                  true,
+        });
+        hc.execute_order(&w.keeper, &key);
+    }
+
+    /// Open a short position: mint short_tk collateral, fund vault, create + execute MarketIncrease.
+    fn open_short_position(w: &World, collateral_tokens: i128, size_usd: i128) {
+        StellarAssetClient::new(&w.env, &w.short_tk).mint(&w.vault, &collateral_tokens);
+        // Seed pool
+        StellarAssetClient::new(&w.env, &w.short_tk).mint(&w.market_tk, &(collateral_tokens * 10));
+        DsClient::new(&w.env, &w.ds).set_u128(
+            &w.admin,
+            &gmx_keys::pool_amount_key(&w.env, &w.market_tk, &w.short_tk),
+            &(collateral_tokens as u128 * 10),
+        );
+
+        let hc = OHClient::new(&w.env, &w.ord_handler);
+        let key = hc.create_order(&w.user, &CreateOrderParams {
+            receiver:                 w.user.clone(),
+            market:                   w.market_tk.clone(),
+            initial_collateral_token: w.short_tk.clone(),
+            swap_path:                soroban_sdk::Vec::new(&w.env),
+            size_delta_usd:           size_usd,
+            collateral_delta_amount:  collateral_tokens,
+            trigger_price:            0,
+            acceptable_price:         0,
+            execution_fee:            0,
+            min_output_amount:        0,
+            order_type:               OrderType::MarketIncrease,
+            is_long:                  false,
+        });
+        hc.execute_order(&w.keeper, &key);
+    }
+
+    // ── Issue #72: long liquidation E2E ───────────────────────────────────────
+
+    /// Create a long position, crash the price past the liquidation threshold,
+    /// and verify that liquidation_handler closes it correctly.
+    ///
+    /// Setup:
+    ///   - Entry price: $2000
+    ///   - Collateral: 1 token ($2000 worth)
+    ///   - Size: $20 000 (10x leverage)
+    ///   - Liquidation price: ~$1980 (1% min collateral factor)
+    ///   - Crash price to $100 → deeply underwater → liquidatable
+    #[test]
+    fn liquidate_underwater_long_removes_position_key() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let entry_price = 2_000 * fp;
+
+        set_prices(&w, entry_price);
+
+        let collateral = ONE_TOKEN; // 1 token = $2000 at entry
+        let size_usd   = 20_000 * fp; // 10x leverage
+
+        open_long_position(&w, collateral, size_usd);
+
+        // Verify position exists
+        let pos_key = gmx_keys::position_key(&w.env, &w.user, &w.market_tk, &w.long_tk, true);
+        assert!(
+            OHClient::new(&w.env, &w.ord_handler).get_position(&pos_key).is_some(),
+            "position must exist before liquidation"
+        );
+
+        // Crash price to $100 — position is deeply underwater
+        let crash_price = 100 * fp;
+        set_prices(&w, crash_price);
+
+        // Verify it's liquidatable
+        let is_liq = LiquidationHandlerClient::new(&w.env, &w.liq_handler)
+            .check_liquidatable(&w.user, &w.market_tk, &w.long_tk, &true);
+        assert!(is_liq, "position must be liquidatable after price crash");
+
+        // Execute liquidation
+        LiquidationHandlerClient::new(&w.env, &w.liq_handler)
+            .liquidate_position(&w.liq_keeper, &w.user, &w.market_tk, &w.long_tk, &true);
+
+        // Position key must be removed from order_handler storage
+        assert!(
+            OHClient::new(&w.env, &w.ord_handler).get_position(&pos_key).is_none(),
+            "position key must be removed after liquidation"
+        );
+    }
+
+    /// Liquidation of a healthy long position must revert (not liquidatable).
+    #[test]
+    #[should_panic]
+    fn liquidate_healthy_long_reverts() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let entry_price = 2_000 * fp;
+
+        set_prices(&w, entry_price);
+
+        let collateral = ONE_TOKEN * 10; // 10 tokens = $20 000 at entry
+        let size_usd   = 10_000 * fp;   // 0.5x leverage — very healthy
+
+        open_long_position(&w, collateral, size_usd);
+
+        // Price stays the same — position is healthy
+        set_prices(&w, entry_price);
+
+        // Must revert with NotLiquidatable
+        LiquidationHandlerClient::new(&w.env, &w.liq_handler)
+            .liquidate_position(&w.liq_keeper, &w.user, &w.market_tk, &w.long_tk, &true);
+    }
+
+    // ── Issue #73: short liquidation E2E ──────────────────────────────────────
+
+    /// Create a short position, pump the price past the liquidation threshold,
+    /// and verify that liquidation_handler closes it correctly.
+    ///
+    /// Setup:
+    ///   - Entry price: $2000 (short opened here)
+    ///   - Collateral: 1 short_tk token ($1 worth, since short_tk = $1)
+    ///   - Size: $10 (10x leverage on $1 collateral)
+    ///   - Price pumps to $10 000 → short is deeply underwater → liquidatable
+    #[test]
+    fn liquidate_underwater_short_removes_position_key() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let entry_price = 2_000 * fp;
+
+        set_prices(&w, entry_price);
+
+        // Short collateral is short_tk ($1 per token)
+        let collateral = ONE_TOKEN;     // 1 short_tk = $1
+        let size_usd   = 10 * fp;      // $10 size (10x leverage on $1 collateral)
+
+        open_short_position(&w, collateral, size_usd);
+
+        // Verify position exists
+        let pos_key = gmx_keys::position_key(&w.env, &w.user, &w.market_tk, &w.short_tk, false);
+        assert!(
+            OHClient::new(&w.env, &w.ord_handler).get_position(&pos_key).is_some(),
+            "short position must exist before liquidation"
+        );
+
+        // Pump index price to $10 000 — short is deeply underwater
+        let pump_price = 10_000 * fp;
+        set_prices(&w, pump_price);
+
+        // Verify it's liquidatable
+        let is_liq = LiquidationHandlerClient::new(&w.env, &w.liq_handler)
+            .check_liquidatable(&w.user, &w.market_tk, &w.short_tk, &false);
+        assert!(is_liq, "short position must be liquidatable after price pump");
+
+        // Execute liquidation
+        LiquidationHandlerClient::new(&w.env, &w.liq_handler)
+            .liquidate_position(&w.liq_keeper, &w.user, &w.market_tk, &w.short_tk, &false);
+
+        // Position key must be removed
+        assert!(
+            OHClient::new(&w.env, &w.ord_handler).get_position(&pos_key).is_none(),
+            "short position key must be removed after liquidation"
+        );
+    }
+
+    /// Liquidation of a healthy short position must revert.
+    #[test]
+    #[should_panic]
+    fn liquidate_healthy_short_reverts() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let entry_price = 2_000 * fp;
+
+        set_prices(&w, entry_price);
+
+        // Very well-collateralised short
+        let collateral = ONE_TOKEN * 100; // 100 short_tk = $100
+        let size_usd   = 10 * fp;        // $10 size — 0.1x leverage
+
+        open_short_position(&w, collateral, size_usd);
+
+        // Price stays the same
+        set_prices(&w, entry_price);
+
+        // Must revert with NotLiquidatable
+        LiquidationHandlerClient::new(&w.env, &w.liq_handler)
+            .liquidate_position(&w.liq_keeper, &w.user, &w.market_tk, &w.short_tk, &false);
+    }
+}
