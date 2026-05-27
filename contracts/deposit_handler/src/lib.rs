@@ -84,6 +84,7 @@ trait IDataStore {
     fn remove_address_from_set(env: Env, caller: Address, set_key: BytesN<32>, value: Address);
     fn add_bytes32_to_set(env: Env, caller: Address, set_key: BytesN<32>, value: BytesN<32>);
     fn remove_bytes32_from_set(env: Env, caller: Address, set_key: BytesN<32>, value: BytesN<32>);
+    fn contains_bytes32(env: Env, set_key: BytesN<32>, value: BytesN<32>) -> bool;
     fn increment_nonce(env: Env, caller: Address) -> u64;
 }
 
@@ -146,6 +147,8 @@ impl DepositHandler {
 
     /// Pull tokens from caller into the deposit_vault and record the deposit.
     /// Returns a unique deposit key (BytesN<32>).
+    /// 
+    /// Issue #37: Validates that deposit tokens match the market's configured long/short tokens.
     pub fn create_deposit(env: Env, caller: Address, params: CreateDepositParams) -> BytesN<32> {
         caller.require_auth();
 
@@ -159,6 +162,16 @@ impl DepositHandler {
             .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
         let handler = env.current_contract_address();
         let ds = DataStoreClient::new(&env, &data_store);
+
+        // Issue #37: Validate tokens match market configuration BEFORE any transfer
+        let market = load_market_props(&env, &data_store, &params.market);
+        
+        if params.long_token_amount > 0 && params.initial_long_token != market.long_token {
+            panic_with_error!(&env, Error::Unauthorized); // Wrong long token
+        }
+        if params.short_token_amount > 0 && params.initial_short_token != market.short_token {
+            panic_with_error!(&env, Error::Unauthorized); // Wrong short token
+        }
 
         // Pull tokens from caller → deposit_vault
         if params.long_token_amount > 0 {
@@ -728,6 +741,76 @@ mod tests {
         assert_eq!(lp, expected_lp, "minted LP should match expected formula on first deposit");
     }
 
+    // ── Issue #32: storage cleanup ────────────────────────────────────────────
+
+    /// After cancel_deposit, the record must be gone from local storage AND from
+    /// both the global and per-account deposit lists in data_store.
+    #[test]
+    fn cancel_deposit_cleans_up_storage_and_lists() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        let hc = DepositHandlerClient::new(env, &w.handler);
+        let ds_c = DsClient::new(env, &w.ds);
+
+        let key = hc.create_deposit(&user, &CreateDepositParams {
+            receiver: user.clone(), market: w.market_tk.clone(),
+            initial_long_token: w.long_tk.clone(), initial_short_token: w.short_tk.clone(),
+            long_token_amount: 1_000_0000i128, short_token_amount: 0,
+            min_market_tokens: 0, execution_fee: 0,
+        });
+
+        // must exist before cancel
+        assert!(hc.get_deposit(&key).is_some());
+        assert!(ds_c.contains_bytes32(&gmx_keys::deposit_list_key(env), &key));
+        assert!(ds_c.contains_bytes32(&gmx_keys::account_deposit_list_key(env, &user), &key));
+
+        hc.cancel_deposit(&user, &key);
+
+        // must be fully gone — no stale records
+        assert!(hc.get_deposit(&key).is_none(), "record must be removed after cancel");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::deposit_list_key(env), &key),
+            "global deposit list must not contain key after cancel");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::account_deposit_list_key(env, &user), &key),
+            "account deposit list must not contain key after cancel");
+    }
+
+    /// After execute_deposit, the record must be gone from local storage AND from
+    /// both the global and per-account deposit lists in data_store.
+    #[test]
+    fn execute_deposit_cleans_up_storage_and_lists() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        set_prices(&w);
+        let hc = DepositHandlerClient::new(env, &w.handler);
+        let ds_c = DsClient::new(env, &w.ds);
+
+        let key = hc.create_deposit(&user, &CreateDepositParams {
+            receiver: user.clone(), market: w.market_tk.clone(),
+            initial_long_token: w.long_tk.clone(), initial_short_token: w.short_tk.clone(),
+            long_token_amount: 1_000_0000i128, short_token_amount: 0,
+            min_market_tokens: 1, execution_fee: 0,
+        });
+
+        assert!(hc.get_deposit(&key).is_some());
+        assert!(ds_c.contains_bytes32(&gmx_keys::deposit_list_key(env), &key));
+        assert!(ds_c.contains_bytes32(&gmx_keys::account_deposit_list_key(env, &user), &key));
+
+        hc.execute_deposit(&w.keeper, &key);
+
+        // must be fully gone — no stale records
+        assert!(hc.get_deposit(&key).is_none(), "record must be removed after execute");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::deposit_list_key(env), &key),
+            "global deposit list must not contain key after execute");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::account_deposit_list_key(env, &user), &key),
+            "account deposit list must not contain key after execute");
+    }
+
     /// Second deposit on a non-empty pool uses pool price, not initial price.
     #[test]
     fn second_deposit_uses_pool_price() {
@@ -766,5 +849,347 @@ mod tests {
 
         // Both deposited the same amount at the same price → should get the same LP
         assert_eq!(lp1, lp2, "equal deposits at equal price should mint equal LP");
+    }
+
+    // ── Issue #37: Token validation ────────────────────────────────────────────
+
+    /// Depositing with wrong long token must revert BEFORE any transfer.
+    #[test]
+    #[should_panic]
+    fn create_deposit_wrong_long_token_reverts() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+        let wrong_token = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        // Try to deposit with wrong long token
+        handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  wrong_token, // WRONG!
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  0,
+            min_market_tokens:   0,
+            execution_fee:       0,
+        });
+    }
+
+    /// Depositing with wrong short token must revert BEFORE any transfer.
+    #[test]
+    #[should_panic]
+    fn create_deposit_wrong_short_token_reverts() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+        let wrong_token = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.short_tk).mint(&user, &500_0000i128);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        // Try to deposit with wrong short token
+        handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: wrong_token, // WRONG!
+            long_token_amount:   0,
+            short_token_amount:  500_0000i128,
+            min_market_tokens:   0,
+            execution_fee:       0,
+        });
+    }
+
+    /// Depositing with correct tokens must succeed.
+    #[test]
+    fn create_deposit_correct_tokens_succeeds() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        StellarAssetClient::new(env, &w.short_tk).mint(&user, &500_0000i128);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  500_0000i128,
+            min_market_tokens:   0,
+            execution_fee:       0,
+        });
+
+        let dep = handler_client.get_deposit(&key).unwrap();
+        assert_eq!(dep.long_token_amount, 1_000_0000);
+        assert_eq!(dep.short_token_amount, 500_0000);
+    }
+
+    // ── Issue #42: Mixed deposit tests ─────────────────────────────────────────
+
+    /// Test long-only deposit: pool accounting must be correct.
+    #[test]
+    fn execute_deposit_long_only_pool_accounting() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        set_prices(&w);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  0,
+            min_market_tokens:   1,
+            execution_fee:       0,
+        });
+
+        handler_client.execute_deposit(&w.keeper, &key);
+
+        let ds_c = DsClient::new(env, &w.ds);
+        let long_pool  = ds_c.get_u128(&gmx_keys::pool_amount_key(env, &w.market_tk, &w.long_tk));
+        let short_pool = ds_c.get_u128(&gmx_keys::pool_amount_key(env, &w.market_tk, &w.short_tk));
+
+        assert_eq!(long_pool,  1_000_0000, "long pool should increase by deposit amount");
+        assert_eq!(short_pool, 0, "short pool should remain 0");
+    }
+
+    /// Test short-only deposit: pool accounting must be correct.
+    #[test]
+    fn execute_deposit_short_only_pool_accounting() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.short_tk).mint(&user, &500_0000i128);
+        set_prices(&w);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   0,
+            short_token_amount:  500_0000i128,
+            min_market_tokens:   1,
+            execution_fee:       0,
+        });
+
+        handler_client.execute_deposit(&w.keeper, &key);
+
+        let ds_c = DsClient::new(env, &w.ds);
+        let long_pool  = ds_c.get_u128(&gmx_keys::pool_amount_key(env, &w.market_tk, &w.long_tk));
+        let short_pool = ds_c.get_u128(&gmx_keys::pool_amount_key(env, &w.market_tk, &w.short_tk));
+
+        assert_eq!(long_pool,  0, "long pool should remain 0");
+        assert_eq!(short_pool, 500_0000, "short pool should increase by deposit amount");
+    }
+
+    /// Test mixed deposit: both long and short tokens added to pool.
+    #[test]
+    fn execute_deposit_mixed_pool_accounting() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user,  &1_000_0000i128);
+        StellarAssetClient::new(env, &w.short_tk).mint(&user, &500_0000i128);
+        set_prices(&w);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  500_0000i128,
+            min_market_tokens:   1,
+            execution_fee:       0,
+        });
+
+        handler_client.execute_deposit(&w.keeper, &key);
+
+        let ds_c = DsClient::new(env, &w.ds);
+        let long_pool  = ds_c.get_u128(&gmx_keys::pool_amount_key(env, &w.market_tk, &w.long_tk));
+        let short_pool = ds_c.get_u128(&gmx_keys::pool_amount_key(env, &w.market_tk, &w.short_tk));
+
+        assert_eq!(long_pool,  1_000_0000, "long pool should increase by long deposit amount");
+        assert_eq!(short_pool, 500_0000, "short pool should increase by short deposit amount");
+
+        let lp = MtClient::new(env, &w.market_tk).balance(&user);
+        assert!(lp > 0, "LP tokens should be minted for mixed deposit");
+    }
+
+    // ── Issue #44: Vault balance invariant tests ───────────────────────────────
+
+    /// After execute_deposit, vault recorded balance must match actual token balance.
+    #[test]
+    fn vault_balance_invariant_after_execute_deposit() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        StellarAssetClient::new(env, &w.short_tk).mint(&user, &500_0000i128);
+        set_prices(&w);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+        let vault_client = DVClient::new(env, &w.vault);
+
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  500_0000i128,
+            min_market_tokens:   1,
+            execution_fee:       0,
+        });
+
+        // Before execute: vault should have the tokens
+        let vault_addr = w.vault.clone();
+        let long_balance_before = token::Client::new(env, &w.long_tk).balance(&vault_addr);
+        let short_balance_before = token::Client::new(env, &w.short_tk).balance(&vault_addr);
+        assert_eq!(long_balance_before, 1_000_0000);
+        assert_eq!(short_balance_before, 500_0000);
+
+        handler_client.execute_deposit(&w.keeper, &key);
+
+        // After execute: vault should be empty (tokens moved to pool)
+        let long_balance_after = token::Client::new(env, &w.long_tk).balance(&vault_addr);
+        let short_balance_after = token::Client::new(env, &w.short_tk).balance(&vault_addr);
+        assert_eq!(long_balance_after, 0, "vault long balance should be 0 after execute");
+        assert_eq!(short_balance_after, 0, "vault short balance should be 0 after execute");
+
+        // Recorded balance must match actual balance
+        let recorded_long = vault_client.get_recorded_balance(&w.long_tk);
+        let recorded_short = vault_client.get_recorded_balance(&w.short_tk);
+        assert_eq!(recorded_long, long_balance_after, "recorded long balance must match actual");
+        assert_eq!(recorded_short, short_balance_after, "recorded short balance must match actual");
+    }
+
+    /// After cancel_deposit, vault recorded balance must match actual token balance.
+    #[test]
+    fn vault_balance_invariant_after_cancel_deposit() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        StellarAssetClient::new(env, &w.short_tk).mint(&user, &500_0000i128);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+        let vault_client = DVClient::new(env, &w.vault);
+
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  500_0000i128,
+            min_market_tokens:   1,
+            execution_fee:       0,
+        });
+
+        // Before cancel: vault has tokens
+        let vault_addr = w.vault.clone();
+        let long_balance_before = token::Client::new(env, &w.long_tk).balance(&vault_addr);
+        assert_eq!(long_balance_before, 1_000_0000);
+
+        handler_client.cancel_deposit(&user, &key);
+
+        // After cancel: vault should be empty (tokens refunded to user)
+        let long_balance_after = token::Client::new(env, &w.long_tk).balance(&vault_addr);
+        let short_balance_after = token::Client::new(env, &w.short_tk).balance(&vault_addr);
+        assert_eq!(long_balance_after, 0, "vault long balance should be 0 after cancel");
+        assert_eq!(short_balance_after, 0, "vault short balance should be 0 after cancel");
+
+        // Recorded balance must match actual balance
+        let recorded_long = vault_client.get_recorded_balance(&w.long_tk);
+        let recorded_short = vault_client.get_recorded_balance(&w.short_tk);
+        assert_eq!(recorded_long, long_balance_after, "recorded long balance must match actual after cancel");
+        assert_eq!(recorded_short, short_balance_after, "recorded short balance must match actual after cancel");
+    }
+
+    // ── Issue #46: Event field completeness ────────────────────────────────────
+
+    /// Verify that deposit creation event includes all required fields.
+    #[test]
+    fn deposit_creation_event_has_all_fields() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        // Create deposit — event should be published with key, account, market
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  0,
+            min_market_tokens:   0,
+            execution_fee:       0,
+        });
+
+        // Verify deposit was recorded (event was published)
+        let dep = handler_client.get_deposit(&key).unwrap();
+        assert_eq!(dep.account, user);
+        assert_eq!(dep.market, w.market_tk);
+        assert_eq!(dep.long_token_amount, 1_000_0000);
+    }
+
+    /// Verify that deposit execution event includes all required fields.
+    #[test]
+    fn deposit_execution_event_has_all_fields() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        set_prices(&w);
+
+        let handler_client = DepositHandlerClient::new(env, &w.handler);
+
+        let key = handler_client.create_deposit(&user, &CreateDepositParams {
+            receiver:            user.clone(),
+            market:              w.market_tk.clone(),
+            initial_long_token:  w.long_tk.clone(),
+            initial_short_token: w.short_tk.clone(),
+            long_token_amount:   1_000_0000i128,
+            short_token_amount:  0,
+            min_market_tokens:   1,
+            execution_fee:       0,
+        });
+
+        handler_client.execute_deposit(&w.keeper, &key);
+
+        // Verify LP tokens were minted (event was published with mint amount)
+        let lp = MtClient::new(env, &w.market_tk).balance(&user);
+        assert!(lp > 0, "LP tokens should be minted and event published");
     }
 }

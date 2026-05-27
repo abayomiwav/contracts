@@ -85,6 +85,7 @@ trait IDataStore {
     fn get_address(env: Env, key: BytesN<32>) -> Option<Address>;
     fn add_bytes32_to_set(env: Env, caller: Address, set_key: BytesN<32>, value: BytesN<32>);
     fn remove_bytes32_from_set(env: Env, caller: Address, set_key: BytesN<32>, value: BytesN<32>);
+    fn contains_bytes32(env: Env, set_key: BytesN<32>, value: BytesN<32>) -> bool;
     fn increment_nonce(env: Env, caller: Address) -> u64;
 }
 
@@ -614,6 +615,79 @@ mod tests {
         let long_back = StellarAssetClient::new(env, &w.long_tk).balance(&user);
         assert!(long_back > 0, "should receive long tokens back");
         assert_eq!(MtClient::new(env, &w.market_tk).balance(&user), 0);
+    }
+
+    // ── Issue #32: storage cleanup ────────────────────────────────────────────
+
+    /// After cancel_withdrawal, the record must be gone from local storage AND
+    /// from both the global and per-account withdrawal lists in data_store.
+    #[test]
+    fn cancel_withdrawal_cleans_up_storage_and_lists() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        set_prices(&w);
+        let lp = do_deposit(&w, &user, 1_000_0000, 0);
+        assert!(lp > 0);
+
+        let wth_key = WithdrawalHandlerClient::new(env, &w.wth_handler)
+            .create_withdrawal(&user, &CreateWithdrawalParams {
+                receiver: user.clone(), market: w.market_tk.clone(),
+                market_token_amount: lp, min_long_token_amount: 0,
+                min_short_token_amount: 0, execution_fee: 0,
+            });
+
+        let ds_c = DsClient::new(env, &w.ds);
+        assert!(WithdrawalHandlerClient::new(env, &w.wth_handler).get_withdrawal(&wth_key).is_some());
+        assert!(ds_c.contains_bytes32(&gmx_keys::withdrawal_list_key(env), &wth_key));
+        assert!(ds_c.contains_bytes32(&gmx_keys::account_withdrawal_list_key(env, &user), &wth_key));
+
+        WithdrawalHandlerClient::new(env, &w.wth_handler).cancel_withdrawal(&user, &wth_key);
+
+        assert!(WithdrawalHandlerClient::new(env, &w.wth_handler).get_withdrawal(&wth_key).is_none(),
+            "record must be removed after cancel");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::withdrawal_list_key(env), &wth_key),
+            "global withdrawal list must not contain key after cancel");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::account_withdrawal_list_key(env, &user), &wth_key),
+            "account withdrawal list must not contain key after cancel");
+    }
+
+    /// After execute_withdrawal, the record must be gone from local storage AND
+    /// from both the global and per-account withdrawal lists in data_store.
+    #[test]
+    fn execute_withdrawal_cleans_up_storage_and_lists() {
+        let w = setup();
+        let env = &w.env;
+        let user = Address::generate(env);
+
+        StellarAssetClient::new(env, &w.long_tk).mint(&user, &1_000_0000i128);
+        set_prices(&w);
+        let lp = do_deposit(&w, &user, 1_000_0000, 0);
+        assert!(lp > 0);
+
+        set_prices(&w);
+        let wth_key = WithdrawalHandlerClient::new(env, &w.wth_handler)
+            .create_withdrawal(&user, &CreateWithdrawalParams {
+                receiver: user.clone(), market: w.market_tk.clone(),
+                market_token_amount: lp, min_long_token_amount: 0,
+                min_short_token_amount: 0, execution_fee: 0,
+            });
+
+        let ds_c = DsClient::new(env, &w.ds);
+        assert!(WithdrawalHandlerClient::new(env, &w.wth_handler).get_withdrawal(&wth_key).is_some());
+        assert!(ds_c.contains_bytes32(&gmx_keys::withdrawal_list_key(env), &wth_key));
+        assert!(ds_c.contains_bytes32(&gmx_keys::account_withdrawal_list_key(env, &user), &wth_key));
+
+        WithdrawalHandlerClient::new(env, &w.wth_handler).execute_withdrawal(&w.keeper, &wth_key);
+
+        assert!(WithdrawalHandlerClient::new(env, &w.wth_handler).get_withdrawal(&wth_key).is_none(),
+            "record must be removed after execute");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::withdrawal_list_key(env), &wth_key),
+            "global withdrawal list must not contain key after execute");
+        assert!(!ds_c.contains_bytes32(&gmx_keys::account_withdrawal_list_key(env, &user), &wth_key),
+            "account withdrawal list must not contain key after execute");
     }
 
     // ── Existing integration tests ────────────────────────────────────────────

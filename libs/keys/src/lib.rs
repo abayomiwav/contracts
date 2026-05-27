@@ -22,9 +22,13 @@ fn push_str(buf: &mut Bytes, env: &Env, s: &str) {
 
 fn push_addr(buf: &mut Bytes, env: &Env, addr: &Address) {
     // Address::to_string() returns the strkey (G... or C...) as a soroban String.
-    // From<soroban_sdk::String> for Bytes is implemented in soroban-sdk.
+    // Copy the string bytes out using copy_into_slice, then append to the buffer.
     let s: soroban_sdk::String = addr.to_string();
-    let b: Bytes = s.into();
+    let str_len = s.len() as usize;
+    // Allocate a fixed-size stack buffer (strkeys are at most 56 chars).
+    let mut raw = [0u8; 64];
+    s.copy_into_slice(&mut raw[..str_len]);
+    let b = Bytes::from_slice(env, &raw[..str_len]);
     let len = b.len() as u16;
     buf.append(&Bytes::from_slice(env, &len.to_be_bytes()));
     buf.append(&b);
