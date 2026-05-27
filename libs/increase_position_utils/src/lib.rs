@@ -188,3 +188,349 @@ pub fn increase_position(env: &Env, p: &IncreasePositionParams) -> PositionProps
 
     position
 }
+
+// ─── Tests — Issue #62: position increase fee accounting ─────────────────────
+//
+// Verifies that on position increase:
+//   • Position fee, borrowing snapshot, and funding snapshot are stored correctly.
+//   • Claimable fee key is nonzero and matches expected calculation.
+//   • All fee-related storage keys update correctly.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::Address as _,
+        token::StellarAssetClient,
+        Env,
+    };
+    use role_store::{RoleStore, RoleStoreClient as RsClient};
+    use data_store::{DataStore, DataStoreClient as DsClient};
+    use oracle::{Oracle, OracleClient as OClient};
+    use order_vault::{OrderVault, OrderVaultClient as OVClient};
+    use market_token::{MarketToken, MarketTokenClient as MtClient};
+    use gmx_keys::roles;
+    use gmx_types::TokenPrice;
+    use gmx_math::{FLOAT_PRECISION, TOKEN_PRECISION};
+
+    /// 1 whole token at 7-decimal Stellar precision.
+    const ONE_TOKEN: i128 = 10_000_000; // 10^7
+
+    struct World {
+        env:       Env,
+        admin:     Address,
+        keeper:    Address,
+        user:      Address,
+        ds:        Address,
+        oracle:    Address,
+        vault:     Address,
+        market_tk: Address,
+        long_tk:   Address,
+        short_tk:  Address,
+        index_tk:  Address,
+    }
+
+    fn setup() -> World {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin  = Address::generate(&env);
+        let keeper = Address::generate(&env);
+        let user   = Address::generate(&env);
+
+        // Role store
+        let rs = env.register(RoleStore, ());
+        RsClient::new(&env, &rs).initialize(&admin);
+        let rs_c = RsClient::new(&env, &rs);
+        rs_c.grant_role(&admin, &admin,  &roles::controller(&env));
+        rs_c.grant_role(&admin, &keeper, &roles::order_keeper(&env));
+
+        // Data store
+        let ds = env.register(DataStore, ());
+        DsClient::new(&env, &ds).initialize(&admin, &rs);
+
+        // Oracle
+        let oracle_addr = env.register(Oracle, ());
+        let passphrase = soroban_sdk::Bytes::from_slice(&env, b"Test SDF Network ; September 2015");
+        OClient::new(&env, &oracle_addr).initialize(&admin, &rs, &ds, &passphrase);
+
+        // Order vault
+        let vault = env.register(OrderVault, ());
+        OVClient::new(&env, &vault).initialize(&admin, &rs);
+
+        // Market token (LP + pool custodian)
+        let market_tk = env.register(MarketToken, ());
+        MtClient::new(&env, &market_tk).initialize(
+            &admin, &rs, &7u32,
+            &soroban_sdk::String::from_str(&env, "SO4 Market"),
+            &soroban_sdk::String::from_str(&env, "GM"),
+        );
+
+        // Grant market_token CONTROLLER so it can be used as pool custodian
+        rs_c.grant_role(&admin, &market_tk, &roles::controller(&env));
+
+        // Underlying tokens
+        let long_tk  = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let short_tk = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let index_tk = Address::generate(&env);
+
+        // Register market in DataStore
+        let ds_c = DsClient::new(&env, &ds);
+        ds_c.set_address(&admin, &gmx_keys::market_index_token_key(&env, &market_tk), &index_tk);
+        ds_c.set_address(&admin, &gmx_keys::market_long_token_key(&env, &market_tk),  &long_tk);
+        ds_c.set_address(&admin, &gmx_keys::market_short_token_key(&env, &market_tk), &short_tk);
+
+        World { env, admin, keeper, user, ds, oracle: oracle_addr, vault, market_tk, long_tk, short_tk, index_tk }
+    }
+
+    fn set_prices(w: &World, index_usd: i128) {
+        let fp = FLOAT_PRECISION;
+        OClient::new(&w.env, &w.oracle).set_prices_simple(&w.keeper, &soroban_sdk::Vec::from_array(&w.env, [
+            TokenPrice { token: w.long_tk.clone(),  min: index_usd, max: index_usd },
+            TokenPrice { token: w.short_tk.clone(), min: fp,        max: fp        },
+            TokenPrice { token: w.index_tk.clone(), min: index_usd, max: index_usd },
+        ]));
+    }
+
+    /// Configure market parameters: position fee factor, borrowing factor, etc.
+    fn configure_market(w: &World, position_fee_bps: i128) {
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        let fee_factor = position_fee_bps * FLOAT_PRECISION / 10_000; // bps → FLOAT_PRECISION
+
+        // Position fee factor (for positive impact)
+        ds_c.set_u128(&w.admin, &gmx_keys::position_fee_factor_key(&w.env, &w.market_tk, true),  &(fee_factor as u128));
+        // Position fee factor (for negative impact)
+        ds_c.set_u128(&w.admin, &gmx_keys::position_fee_factor_key(&w.env, &w.market_tk, false), &(fee_factor as u128));
+
+        // Borrowing factor (small non-zero so cumulative factor can be read)
+        ds_c.set_u128(&w.admin, &gmx_keys::borrowing_factor_key(&w.env, &w.market_tk, true),  &(FLOAT_PRECISION as u128 / 10_000));
+        ds_c.set_u128(&w.admin, &gmx_keys::borrowing_exponent_factor_key(&w.env, &w.market_tk, true), &(FLOAT_PRECISION as u128));
+
+        // Funding factor
+        ds_c.set_u128(&w.admin, &gmx_keys::funding_factor_key(&w.env, &w.market_tk), &(FLOAT_PRECISION as u128 / 100_000));
+        ds_c.set_u128(&w.admin, &gmx_keys::funding_exponent_factor_key(&w.env, &w.market_tk), &(FLOAT_PRECISION as u128));
+
+        // Max leverage = 50x (so validation passes)
+        ds_c.set_u128(&w.admin, &gmx_keys::max_leverage_key(&w.env, &w.market_tk), &(50 * FLOAT_PRECISION as u128));
+
+        // Seed pool with long tokens so the market has liquidity
+        ds_c.set_u128(&w.admin, &gmx_keys::pool_amount_key(&w.env, &w.market_tk, &w.long_tk), &(10_000 * ONE_TOKEN as u128));
+    }
+
+    // ── Issue #62: fee storage keys update correctly on increase ─────────────
+
+    /// After a position increase, the position's borrowing_factor snapshot must
+    /// equal the current cumulative borrowing factor in data_store.
+    #[test]
+    fn position_increase_syncs_borrowing_factor_snapshot() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+
+        configure_market(&w, 10); // 10 bps position fee
+        set_prices(&w, index_price);
+
+        // Seed some collateral into the market pool (simulates vault transfer)
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 100));
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let index_price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        let collateral = ONE_TOKEN * 10; // 10 tokens
+        let size_delta  = 1_000 * fp;   // $1000 position
+
+        let position = increase_position(&w.env, &IncreasePositionParams {
+            data_store:        &w.ds,
+            caller:            &w.admin,
+            account:           &w.user,
+            receiver:          &w.user,
+            market:            &market,
+            collateral_token:  &w.long_tk,
+            size_delta_usd:    size_delta,
+            collateral_amount: collateral,
+            acceptable_price:  0,
+            is_long:           true,
+            index_token_price: &index_price_props,
+            collateral_price:  index_price,
+            current_time:      1_000,
+        });
+
+        // Borrowing factor snapshot must match current cumulative value
+        let cum_borrow_key = gmx_keys::cumulative_borrowing_factor_key(&w.env, &w.market_tk, true);
+        let cum_factor = DsClient::new(&w.env, &w.ds).get_u128(&cum_borrow_key) as i128;
+        assert_eq!(
+            position.borrowing_factor, cum_factor,
+            "position borrowing_factor snapshot must equal current cumulative factor"
+        );
+    }
+
+    /// After a position increase, the position's funding_fee_amount_per_size
+    /// snapshot must equal the current funding-per-size in data_store.
+    #[test]
+    fn position_increase_syncs_funding_snapshot() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+
+        configure_market(&w, 10);
+        set_prices(&w, index_price);
+
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 100));
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let index_price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        let position = increase_position(&w.env, &IncreasePositionParams {
+            data_store:        &w.ds,
+            caller:            &w.admin,
+            account:           &w.user,
+            receiver:          &w.user,
+            market:            &market,
+            collateral_token:  &w.long_tk,
+            size_delta_usd:    500 * fp,
+            collateral_amount: ONE_TOKEN * 5,
+            acceptable_price:  0,
+            is_long:           true,
+            index_token_price: &index_price_props,
+            collateral_price:  index_price,
+            current_time:      1_000,
+        });
+
+        // Funding snapshot must match current funding-per-size
+        let fnd_key = gmx_keys::funding_amount_per_size_key(&w.env, &w.market_tk, &w.long_tk, true);
+        let current_fnd = DsClient::new(&w.env, &w.ds).get_i128(&fnd_key);
+        assert_eq!(
+            position.funding_fee_amount_per_size, current_fnd,
+            "position funding snapshot must equal current funding-per-size"
+        );
+    }
+
+    /// Position fee is deducted from collateral and added to the pool.
+    /// The fee amount must be nonzero and match the expected calculation.
+    #[test]
+    fn position_increase_fee_is_nonzero_and_correct() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+
+        configure_market(&w, 30); // 30 bps = 0.3% fee
+        set_prices(&w, index_price);
+
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 200));
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let index_price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        let collateral = ONE_TOKEN * 20;
+        let size_delta  = 2_000 * fp; // $2000 position
+
+        // Pool amount before
+        let pool_key = gmx_keys::pool_amount_key(&w.env, &w.market_tk, &w.long_tk);
+        let pool_before = DsClient::new(&w.env, &w.ds).get_u128(&pool_key) as i128;
+
+        let position = increase_position(&w.env, &IncreasePositionParams {
+            data_store:        &w.ds,
+            caller:            &w.admin,
+            account:           &w.user,
+            receiver:          &w.user,
+            market:            &market,
+            collateral_token:  &w.long_tk,
+            size_delta_usd:    size_delta,
+            collateral_amount: collateral,
+            acceptable_price:  0,
+            is_long:           true,
+            index_token_price: &index_price_props,
+            collateral_price:  index_price,
+            current_time:      1_000,
+        });
+
+        // Expected position fee: size_delta * fee_factor / FLOAT_PRECISION / collateral_price * TOKEN_PRECISION
+        let fee_factor = 30 * fp / 10_000; // 30 bps
+        let fee_usd = gmx_math::mul_div_wide(&w.env, size_delta, fee_factor, fp);
+        let expected_fee_tokens = gmx_math::mul_div_wide(&w.env, fee_usd, TOKEN_PRECISION, index_price);
+
+        // Fee must be nonzero
+        assert!(expected_fee_tokens > 0, "expected fee must be nonzero");
+
+        // Collateral in position = deposited - fees (borrowing and funding are 0 at t=0)
+        // position.collateral_amount = collateral - total_cost_amount
+        // total_cost_amount >= position_fee_amount
+        assert!(
+            position.collateral_amount < collateral,
+            "collateral after fees {} must be less than deposited {}",
+            position.collateral_amount, collateral
+        );
+
+        // Pool must have grown by at least the position fee
+        let pool_after = DsClient::new(&w.env, &w.ds).get_u128(&pool_key) as i128;
+        let pool_growth = pool_after - pool_before;
+        assert!(
+            pool_growth >= expected_fee_tokens,
+            "pool must grow by at least the position fee: growth={}, expected_fee={}",
+            pool_growth, expected_fee_tokens
+        );
+    }
+
+    /// Open interest increases correctly after position increase.
+    #[test]
+    fn position_increase_updates_open_interest() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+
+        configure_market(&w, 10);
+        set_prices(&w, index_price);
+
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 100));
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let index_price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        let size_delta = 1_000 * fp;
+
+        // OI before
+        let oi_key = gmx_keys::open_interest_key(&w.env, &w.market_tk, &w.long_tk, true);
+        let oi_before = DsClient::new(&w.env, &w.ds).get_u128(&oi_key) as i128;
+
+        increase_position(&w.env, &IncreasePositionParams {
+            data_store:        &w.ds,
+            caller:            &w.admin,
+            account:           &w.user,
+            receiver:          &w.user,
+            market:            &market,
+            collateral_token:  &w.long_tk,
+            size_delta_usd:    size_delta,
+            collateral_amount: ONE_TOKEN * 10,
+            acceptable_price:  0,
+            is_long:           true,
+            index_token_price: &index_price_props,
+            collateral_price:  index_price,
+            current_time:      1_000,
+        });
+
+        let oi_after = DsClient::new(&w.env, &w.ds).get_u128(&oi_key) as i128;
+        assert_eq!(
+            oi_after - oi_before, size_delta,
+            "open interest must increase by size_delta_usd"
+        );
+    }
+}

@@ -268,3 +268,311 @@ pub fn get_execution_price(
     // = size_delta_usd × TOKEN_PRECISION / adjusted_tokens  → FLOAT_PRECISION per whole token
     mul_div_wide(env, size_delta_usd, TOKEN_PRECISION, adjusted_tokens)
 }
+
+// ─── Tests — Issue #61: negative swap price impact accounting ─────────────────
+//
+// Verifies that when a swap worsens pool balance:
+//   • The impact pool delta equals the negative impact amount (pool grows).
+//   • The user's output is reduced by the same amount.
+//   • Multiple impact magnitudes are covered.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+    use role_store::{RoleStore, RoleStoreClient as RsClient};
+    use data_store::{DataStore, DataStoreClient as DsClient};
+    use gmx_keys::roles;
+    use gmx_math::{FLOAT_PRECISION, TOKEN_PRECISION, mul_div_wide};
+
+    fn deploy_role_store(env: &Env, admin: &Address) -> Address {
+        let id = env.register(RoleStore, ());
+        RsClient::new(env, &id).initialize(admin);
+        id
+    }
+
+    fn deploy_data_store(env: &Env, admin: &Address, rs: &Address) -> Address {
+        let id = env.register(DataStore, ());
+        DsClient::new(env, &id).initialize(admin, rs);
+        id
+    }
+
+    fn setup(env: &Env) -> (Address, Address, Address, Address, Address, Address) {
+        let admin = Address::generate(env);
+        let rs = deploy_role_store(env, &admin);
+        let ds = deploy_data_store(env, &admin, &rs);
+
+        let rs_c = RsClient::new(env, &rs);
+        rs_c.grant_role(&admin, &admin, &roles::controller(env));
+
+        let market_token = Address::generate(env);
+        let long_token   = Address::generate(env);
+        let short_token  = Address::generate(env);
+        let _index_token  = Address::generate(env);
+
+        (admin, ds, market_token, _index_token, long_token, short_token)
+    }
+
+    fn make_market(
+        market_token: &Address,
+        index_token: &Address,
+        long_token: &Address,
+        short_token: &Address,
+    ) -> MarketProps {
+        MarketProps {
+            market_token: market_token.clone(),
+            index_token:  index_token.clone(),
+            long_token:   long_token.clone(),
+            short_token:  short_token.clone(),
+        }
+    }
+
+    /// Seed pool amounts and impact factors in data_store.
+    fn seed_swap_market(
+        env: &Env,
+        ds: &Address,
+        caller: &Address,
+        market: &MarketProps,
+        long_pool: i128,
+        short_pool: i128,
+        neg_factor: i128,   // FLOAT_PRECISION
+        pos_factor: i128,   // FLOAT_PRECISION
+        exponent: i128,     // FLOAT_PRECISION (1.0 = linear)
+    ) {
+        let ds_c = DsClient::new(env, ds);
+        // Pool amounts (raw token units)
+        ds_c.set_u128(
+            caller,
+            &gmx_keys::pool_amount_key(env, &market.market_token, &market.long_token),
+            &(long_pool as u128),
+        );
+        ds_c.set_u128(
+            caller,
+            &gmx_keys::pool_amount_key(env, &market.market_token, &market.short_token),
+            &(short_pool as u128),
+        );
+        // Impact factors
+        ds_c.set_u128(
+            caller,
+            &gmx_keys::swap_impact_factor_key(env, &market.market_token, false),
+            &(neg_factor as u128),
+        );
+        ds_c.set_u128(
+            caller,
+            &gmx_keys::swap_impact_factor_key(env, &market.market_token, true),
+            &(pos_factor as u128),
+        );
+        ds_c.set_u128(
+            caller,
+            &gmx_keys::swap_impact_exponent_factor_key(env, &market.market_token),
+            &(exponent as u128),
+        );
+    }
+
+    // ── Issue #61: negative impact increases impact pool ──────────────────────
+
+    /// When a swap worsens pool balance (token_in side already larger),
+    /// the impact is negative, and the impact pool for token_out grows by
+    /// exactly the absolute impact amount.
+    #[test]
+    fn negative_swap_impact_increases_impact_pool() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+        // Swapping long→short worsens the imbalance → negative impact
+        let price = FLOAT_PRECISION; // $1 per token
+        let long_pool  = 2_000 * TOKEN_PRECISION;
+        let short_pool = 1_000 * TOKEN_PRECISION;
+        let neg_factor = FLOAT_PRECISION / 1000; // 0.1% per unit
+        let pos_factor = FLOAT_PRECISION / 2000;
+        let exponent   = FLOAT_PRECISION;        // linear (exponent = 1.0)
+
+        seed_swap_market(&env, &ds, &admin, &market, long_pool, short_pool, neg_factor, pos_factor, exponent);
+
+        let amount_in = 100 * TOKEN_PRECISION; // swap 100 long tokens
+
+        // Compute impact
+        let impact_usd = get_swap_price_impact(
+            &env, &ds, &market,
+            &lt, &st,
+            amount_in, price, price,
+        );
+
+        // Impact must be negative (worsens balance)
+        assert!(impact_usd < 0, "impact must be negative when worsening pool balance, got {}", impact_usd);
+
+        // Record impact pool before
+        let pool_key = gmx_keys::swap_impact_pool_amount_key(&env, &mt, &st);
+        let pool_before = DsClient::new(&env, &ds).get_u128(&pool_key) as i128;
+
+        // Apply impact
+        let impact_amount = apply_swap_impact_value(
+            &env, &ds, &admin, &market, &st, price, impact_usd,
+        );
+
+        let pool_after = DsClient::new(&env, &ds).get_u128(&pool_key) as i128;
+
+        // Impact amount should be negative (user loses tokens)
+        assert!(impact_amount < 0, "impact_amount must be negative for negative impact");
+
+        // Pool must have grown by |impact_amount| (negative impact → pool grows)
+        let pool_delta = pool_after - pool_before;
+        assert_eq!(
+            pool_delta, -impact_amount,
+            "impact pool delta must equal |impact_amount|: pool_delta={}, impact_amount={}",
+            pool_delta, impact_amount
+        );
+    }
+
+    /// User output is reduced by the absolute impact amount when impact is negative.
+    #[test]
+    fn negative_swap_impact_reduces_user_output() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+
+        let price = FLOAT_PRECISION;
+        let long_pool  = 3_000 * TOKEN_PRECISION;
+        let short_pool =   500 * TOKEN_PRECISION;
+        let neg_factor = FLOAT_PRECISION / 500;
+        let pos_factor = FLOAT_PRECISION / 1000;
+        let exponent   = FLOAT_PRECISION;
+
+        seed_swap_market(&env, &ds, &admin, &market, long_pool, short_pool, neg_factor, pos_factor, exponent);
+
+        // Set swap fee factor to 0 so we isolate impact effect
+        DsClient::new(&env, &ds).set_u128(
+            &admin,
+            &gmx_keys::swap_fee_factor_key(&env, &mt, false),
+            &0u128,
+        );
+        DsClient::new(&env, &ds).set_u128(
+            &admin,
+            &gmx_keys::swap_fee_factor_key(&env, &mt, true),
+            &0u128,
+        );
+
+        let amount_in = 200 * TOKEN_PRECISION;
+
+        // Output without any impact: amount_in * price_in / price_out = amount_in (same price)
+        let baseline_output = amount_in; // price_in == price_out
+
+        let (net_output, _fee) = get_swap_output_amount(
+            &env, &ds, &market,
+            &lt, &st,
+            amount_in, price, price,
+            false, // for_positive_impact = false (negative impact scenario)
+        );
+
+        // Net output must be less than baseline (impact reduces output)
+        assert!(
+            net_output < baseline_output,
+            "net_output {} must be less than baseline {} when impact is negative",
+            net_output, baseline_output
+        );
+
+        // The reduction must equal the absolute impact amount
+        let impact_usd = get_swap_price_impact(&env, &ds, &market, &lt, &st, amount_in, price, price);
+        assert!(impact_usd < 0, "impact must be negative");
+        let impact_tokens = mul_div_wide(&env, impact_usd.abs(), TOKEN_PRECISION, price);
+        let reduction = baseline_output - net_output;
+        assert_eq!(
+            reduction, impact_tokens,
+            "output reduction {} must equal impact tokens {}",
+            reduction, impact_tokens
+        );
+    }
+
+    /// Multiple impact magnitudes: larger imbalance → larger negative impact.
+    #[test]
+    fn negative_impact_scales_with_imbalance_magnitude() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+
+        let price = FLOAT_PRECISION;
+        let neg_factor = FLOAT_PRECISION / 100;
+        let pos_factor = FLOAT_PRECISION / 200;
+        let exponent   = FLOAT_PRECISION;
+
+        // Small imbalance: long=1100, short=1000
+        seed_swap_market(&env, &ds, &admin, &market, 1_100 * TOKEN_PRECISION, 1_000 * TOKEN_PRECISION, neg_factor, pos_factor, exponent);
+        let impact_small = get_swap_price_impact(&env, &ds, &market, &lt, &st, 50 * TOKEN_PRECISION, price, price);
+
+        // Large imbalance: long=5000, short=1000
+        seed_swap_market(&env, &ds, &admin, &market, 5_000 * TOKEN_PRECISION, 1_000 * TOKEN_PRECISION, neg_factor, pos_factor, exponent);
+        let impact_large = get_swap_price_impact(&env, &ds, &market, &lt, &st, 50 * TOKEN_PRECISION, price, price);
+
+        // Both must be negative
+        assert!(impact_small < 0, "small imbalance impact must be negative");
+        assert!(impact_large < 0, "large imbalance impact must be negative");
+
+        // Larger imbalance → larger (more negative) impact
+        assert!(
+            impact_large < impact_small,
+            "larger imbalance must produce larger negative impact: large={}, small={}",
+            impact_large, impact_small
+        );
+    }
+
+    // ── Issue #61: position price impact pool accounting ─────────────────────
+
+    /// Negative position price impact increases the position impact pool.
+    #[test]
+    fn negative_position_impact_increases_impact_pool() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = setup(&env);
+        let market = make_market(&mt, &it, &lt, &st);
+
+        let index_price = 2_000 * FLOAT_PRECISION; // $2000 per token
+        let neg_factor  = FLOAT_PRECISION / 1000;
+        let pos_factor  = FLOAT_PRECISION / 2000;
+        let exponent    = FLOAT_PRECISION;
+
+        let ds_c = DsClient::new(&env, &ds);
+        ds_c.set_u128(&admin, &gmx_keys::position_impact_factor_key(&env, &mt, false), &(neg_factor as u128));
+        ds_c.set_u128(&admin, &gmx_keys::position_impact_factor_key(&env, &mt, true),  &(pos_factor as u128));
+        ds_c.set_u128(&admin, &gmx_keys::position_impact_exponent_factor_key(&env, &mt), &(exponent as u128));
+
+        // Seed OI: long=5000 USD, short=1000 USD (long side larger)
+        // Opening more long worsens imbalance → negative impact
+        ds_c.set_u128(&admin, &gmx_keys::open_interest_key(&env, &mt, &lt, true),  &(5_000 * FLOAT_PRECISION as u128));
+        ds_c.set_u128(&admin, &gmx_keys::open_interest_key(&env, &mt, &lt, false), &(1_000 * FLOAT_PRECISION as u128));
+
+        let size_delta = 1_000 * FLOAT_PRECISION; // $1000 increase
+
+        let impact_usd = get_position_price_impact(
+            &env, &ds, &market,
+            true,  // is_long
+            size_delta,
+            true,  // is_increase
+            index_price,
+        );
+
+        assert!(impact_usd < 0, "opening more long when long>short must be negative impact, got {}", impact_usd);
+
+        // Record pool before
+        let pool_key = gmx_keys::position_impact_pool_amount_key(&env, &mt);
+        let pool_before = ds_c.get_u128(&pool_key) as i128;
+
+        // Apply impact
+        let impact_amount = apply_position_impact_value(&env, &ds, &admin, &market, impact_usd, index_price);
+
+        let pool_after = DsClient::new(&env, &ds).get_u128(&pool_key) as i128;
+
+        // Negative impact → pool grows
+        assert!(impact_amount < 0, "impact_amount must be negative");
+        let pool_delta = pool_after - pool_before;
+        assert_eq!(
+            pool_delta, -impact_amount,
+            "impact pool delta must equal |impact_amount|: pool_delta={}, impact_amount={}",
+            pool_delta, impact_amount
+        );
+    }
+}
+
+
+
