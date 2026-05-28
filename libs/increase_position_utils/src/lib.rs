@@ -533,4 +533,161 @@ mod tests {
             "open interest must increase by size_delta_usd"
         );
     }
+
+    // ── Issue #155/#126: per-market OI cap enforcement ────────────────────────
+
+    fn open_params<'a>(
+        w: &'a World,
+        market: &'a gmx_types::MarketProps,
+        index_price_props: &'a gmx_types::PriceProps,
+        size_delta: i128,
+        index_price: i128,
+    ) -> IncreasePositionParams<'a> {
+        IncreasePositionParams {
+            data_store:        &w.ds,
+            caller:            &w.admin,
+            account:           &w.user,
+            receiver:          &w.user,
+            market,
+            collateral_token:  &w.long_tk,
+            size_delta_usd:    size_delta,
+            collateral_amount: ONE_TOKEN * 50,
+            acceptable_price:  0,
+            is_long:           true,
+            index_token_price: index_price_props,
+            collateral_price:  index_price,
+            current_time:      1_000,
+        }
+    }
+
+    /// When no MAX_OPEN_INTEREST cap is configured for a market/side, positions
+    /// of any size are accepted (cap = 0 means uncapped).
+    #[test]
+    fn oi_cap_unconfigured_allows_any_size() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+
+        configure_market(&w, 10);
+        set_prices(&w, index_price);
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 500));
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        // No MAX_OPEN_INTEREST key set → cap is 0 → treated as uncapped
+        let position = increase_position(&w.env, &open_params(&w, &market, &price_props, 100_000 * fp, index_price));
+        assert!(position.size_in_usd > 0, "uncapped market must accept large position");
+    }
+
+    /// A position that brings total OI exactly to the cap is accepted.
+    #[test]
+    fn oi_cap_at_cap_is_accepted() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+        let cap: u128 = (5_000 * fp) as u128; // $5000 cap for longs
+
+        configure_market(&w, 10);
+        set_prices(&w, index_price);
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 500));
+
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        ds_c.set_u128(&w.admin, &gmx_keys::max_open_interest_key(&w.env, &w.market_tk, true), &cap);
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        // Open a position exactly at the cap
+        let position = increase_position(&w.env, &open_params(&w, &market, &price_props, cap as i128, index_price));
+        assert_eq!(position.size_in_usd, cap as i128, "position at cap must be accepted");
+
+        // Verify OI in data_store equals exactly the cap
+        let oi_key = gmx_keys::open_interest_key(&w.env, &w.market_tk, &w.long_tk, true);
+        let oi = ds_c.get_u128(&oi_key);
+        assert_eq!(oi, cap, "OI in data_store must equal cap after at-cap position");
+    }
+
+    /// A position that would push total OI over the configured cap must revert.
+    #[test]
+    #[should_panic]
+    fn oi_cap_over_cap_reverts() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+        let cap: u128 = (2_000 * fp) as u128; // $2000 cap for longs
+
+        configure_market(&w, 10);
+        set_prices(&w, index_price);
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 500));
+
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        ds_c.set_u128(&w.admin, &gmx_keys::max_open_interest_key(&w.env, &w.market_tk, true), &cap);
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        // Attempt to open a position that exceeds the cap — must revert
+        increase_position(&w.env, &open_params(&w, &market, &price_props, cap as i128 + fp, index_price));
+    }
+
+    /// Cap is per-side: a long OI cap does not affect short positions.
+    #[test]
+    fn oi_cap_is_per_side() {
+        let w = setup();
+        let fp = FLOAT_PRECISION;
+        let index_price = 2_000 * fp;
+        let long_cap: u128 = (1_000 * fp) as u128; // tight cap on longs
+
+        configure_market(&w, 10);
+        set_prices(&w, index_price);
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.market_tk, &(ONE_TOKEN * 500));
+        StellarAssetClient::new(&w.env, &w.short_tk).mint(&w.market_tk, &(ONE_TOKEN * 500));
+
+        let ds_c = DsClient::new(&w.env, &w.ds);
+        // Set cap only on longs; shorts remain uncapped
+        ds_c.set_u128(&w.admin, &gmx_keys::max_open_interest_key(&w.env, &w.market_tk, true), &long_cap);
+
+        let market = gmx_types::MarketProps {
+            market_token:  w.market_tk.clone(),
+            index_token:   w.index_tk.clone(),
+            long_token:    w.long_tk.clone(),
+            short_token:   w.short_tk.clone(),
+        };
+        let price_props = gmx_types::PriceProps { min: index_price, max: index_price };
+
+        // Short position of 5000 USD should succeed (no short cap)
+        let short_params = IncreasePositionParams {
+            data_store:        &w.ds,
+            caller:            &w.admin,
+            account:           &w.user,
+            receiver:          &w.user,
+            market:            &market,
+            collateral_token:  &w.long_tk,
+            size_delta_usd:    5_000 * fp,
+            collateral_amount: ONE_TOKEN * 50,
+            acceptable_price:  0,
+            is_long:           false,
+            index_token_price: &price_props,
+            collateral_price:  index_price,
+            current_time:      1_000,
+        };
+        let short_pos = increase_position(&w.env, &short_params);
+        assert!(short_pos.size_in_usd > 0, "short position must succeed when only long cap is set");
+    }
 }

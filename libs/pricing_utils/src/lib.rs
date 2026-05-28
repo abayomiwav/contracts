@@ -12,7 +12,7 @@
 
 use soroban_sdk::{Address, BytesN, Env};
 use gmx_types::MarketProps;
-use gmx_math::{FLOAT_PRECISION, TOKEN_PRECISION, mul_div_wide, pow_factor};
+use gmx_math::{FLOAT_PRECISION, TOKEN_PRECISION, mul_div_wide, mul_div_wide_up, pow_factor};
 use gmx_keys::{
     swap_impact_factor_key, swap_impact_exponent_factor_key,
     position_impact_factor_key, position_impact_exponent_factor_key,
@@ -153,10 +153,10 @@ pub fn get_swap_output_amount(
     // Raw output before fees (price conversion)
     let amount_out_before_fees = mul_div_wide(env, amount_in, price_in, price_out);
 
-    // Swap fee
+    // Swap fee — round up so the protocol never under-collects
     let fee_factor = DataStoreClient::new(env, data_store)
         .get_u128(&swap_fee_factor_key(env, &market.market_token, for_positive_impact)) as i128;
-    let fee_amount = mul_div_wide(env, amount_out_before_fees, fee_factor, FLOAT_PRECISION);
+    let fee_amount = mul_div_wide_up(env, amount_out_before_fees, fee_factor, FLOAT_PRECISION);
 
     // Price impact (in token_out units)
     let impact_usd = get_swap_price_impact(env, data_store, market, token_in, token_out, amount_in, price_in, price_out);

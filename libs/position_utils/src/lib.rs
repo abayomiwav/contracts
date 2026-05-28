@@ -5,7 +5,7 @@
 
 use soroban_sdk::{Address, BytesN, Env};
 use gmx_types::{MarketProps, PositionProps, PositionFees, PriceProps};
-use gmx_math::{FLOAT_PRECISION, TOKEN_PRECISION, mul_div_wide};
+use gmx_math::{FLOAT_PRECISION, TOKEN_PRECISION, mul_div_wide, mul_div_wide_up};
 use gmx_keys::{
     cumulative_borrowing_factor_key,
     funding_amount_per_size_key,
@@ -84,14 +84,14 @@ pub fn get_position_fees(
 ) -> PositionFees {
     let ds = DataStoreClient::new(env, data_store);
 
-    // 1. BORROWING FEE
+    // 1. BORROWING FEE — round up so the protocol never under-collects
     let cum_borrow_key = cumulative_borrowing_factor_key(env, &market.market_token, position.is_long);
     let cum_borrow_factor = ds.get_u128(&cum_borrow_key) as i128;
     let borrow_delta = (cum_borrow_factor - position.borrowing_factor).max(0);
-    // fee = delta × size_in_tokens / FLOAT_PRECISION  (result is raw collateral token units)
-    let borrowing_fee_amount = mul_div_wide(env, borrow_delta, position.size_in_tokens, FLOAT_PRECISION);
+    // fee = delta × size_in_tokens / FLOAT_PRECISION  (round up → protocol favor)
+    let borrowing_fee_amount = mul_div_wide_up(env, borrow_delta, position.size_in_tokens, FLOAT_PRECISION);
 
-    // 2. FUNDING FEE
+    // 2. FUNDING FEE — round up so the protocol never under-collects
     let funding_key = funding_amount_per_size_key(
         env, &market.market_token, &position.collateral_token, position.is_long
     );
@@ -100,9 +100,10 @@ pub fn get_position_fees(
     // If delta > 0: position owes funding; if <= 0: position is owed (claimable, fee = 0 here)
     let funding_fee_amount = if funding_delta > 0 {
         // fee in collateral tokens = delta × size_in_usd / FLOAT_PRECISION / collateral_price × TOKEN_PRECISION
-        let fee_usd = mul_div_wide(env, funding_delta, position.size_in_usd, FLOAT_PRECISION);
+        // Each division rounds up to ensure the owed amount is never under-charged
+        let fee_usd = mul_div_wide_up(env, funding_delta, position.size_in_usd, FLOAT_PRECISION);
         if collateral_token_price > 0 {
-            mul_div_wide(env, fee_usd, TOKEN_PRECISION, collateral_token_price)
+            mul_div_wide_up(env, fee_usd, TOKEN_PRECISION, collateral_token_price)
         } else {
             0
         }
@@ -110,12 +111,12 @@ pub fn get_position_fees(
         0
     };
 
-    // 3. POSITION FEE (opening/closing fee)
+    // 3. POSITION FEE (opening/closing fee) — round up so the protocol never under-collects
     let fee_factor_key = position_fee_factor_key(env, &market.market_token, for_positive_impact);
     let fee_factor = ds.get_u128(&fee_factor_key) as i128;
-    let position_fee_usd = mul_div_wide(env, size_delta_usd, fee_factor, FLOAT_PRECISION);
+    let position_fee_usd = mul_div_wide_up(env, size_delta_usd, fee_factor, FLOAT_PRECISION);
     let position_fee_amount = if collateral_token_price > 0 {
-        mul_div_wide(env, position_fee_usd, TOKEN_PRECISION, collateral_token_price)
+        mul_div_wide_up(env, position_fee_usd, TOKEN_PRECISION, collateral_token_price)
     } else {
         0
     };

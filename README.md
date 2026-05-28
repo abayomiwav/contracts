@@ -160,6 +160,66 @@ DataStore recorded balance equals its actual on-chain SEP-41 balance.
 
 ---
 
+## Keeper Trust Model and Execution Timing
+
+> **Resolves issue #154/#125 — Document keeper execution timing and front-running design.**
+
+### What keepers can do
+
+Keepers are permissioned off-chain bots that hold role-store roles (`ORDER_KEEPER`,
+`LIQUIDATION_KEEPER`, `ADL_KEEPER`). They observe pending requests and choose **when** to
+submit the execution transaction. This gives a keeper limited influence over two variables:
+
+1. **Oracle prices** — The keeper submits `set_prices` and `execute_order` in the same
+   transaction. The oracle prices therefore reflect the market at the ledger the keeper
+   chose, not the ledger the user chose.
+2. **Execution timing** — A keeper can delay execution, waiting for a price movement that
+   benefits them or harms the user, within the bounds of the acceptable-price window.
+
+### What the protocol does to limit the damage
+
+| Protection | Mechanism |
+|---|---|
+| **Acceptable price window** | Every `MarketIncrease` / `MarketDecrease` / swap order carries `acceptable_price`. `execute_order` reverts if the oracle execution price is worse than this bound. A tight window forces the keeper to execute at a fair price or not at all. |
+| **Role gating** | Only accounts holding the `ORDER_KEEPER` role (assigned by admin) can call `execute_order`. Rogue keeper candidates must first compromise the admin key or role-store. |
+| **Atomic price + execution** | Prices are set in the same transaction as execution. The keeper cannot front-run itself by setting prices in an earlier ledger. |
+| **Price impact** | Large positions that worsens OI balance incur negative price impact, reducing the keeper's incentive to push oversized trades through. |
+| **Per-market OI caps** | `MAX_OPEN_INTEREST` per market per side prevents a compromised keeper from accumulating unbounded OI that could drain the pool. |
+
+### Known risks and latency gap
+
+Soroban ledgers close approximately every **5–6 seconds** on the live network. The
+expected keeper round-trip (observe → sign → submit → confirm) is **1–3 ledgers**. This
+means a keeper may observe a price `P` at ledger `L` but execute at ledger `L+2`, when
+the true price is `P′ ≠ P`.
+
+The `acceptable_price` window is the primary mitigation. Its width is user-controlled:
+a tight window (e.g. 0.1 % slippage) limits the price deviation a keeper can exploit
+to that band. A user who sets `acceptable_price = 0` (no check) accepts unbounded
+timing risk.
+
+**Known residual risk:** A keeper that controls block inclusion (e.g. a validator that is
+also a keeper) could theoretically execute at the worst price within the acceptable window
+on every trade. The protocol does not defend against this at the smart-contract level.
+Mitigation strategies — such as multiple competing keepers and keeper-reputation staking —
+are operational concerns outside the current scope.
+
+### Acceptable price guidance for order creators
+
+| Order type | Recommended `acceptable_price` |
+|---|---|
+| `MarketIncrease` (long) | oracle mid-price × (1 + max_slippage) |
+| `MarketIncrease` (short) | oracle mid-price × (1 − max_slippage) |
+| `MarketDecrease` (long) | oracle mid-price × (1 − max_slippage) |
+| `MarketDecrease` (short) | oracle mid-price × (1 + max_slippage) |
+| `LimitIncrease` / `LimitDecrease` | set to trigger price (order is only executed at or better than trigger) |
+| Swap orders | min output amount derived from worst-case impact + slippage |
+
+A `max_slippage` of 0.5 %–1 % covers normal 1–3 ledger delay at typical volatility
+while protecting against malicious timing within the window.
+
+---
+
 ## Canonical Storage Model
 
 > **Resolves issue #2 — Decide the canonical storage model for requests and positions.**
@@ -1037,6 +1097,8 @@ New contributors should read this before working on math, risk, or fee logic.
 | **Trigger price** | The oracle price level at which a limit or stop order becomes eligible for execution. Checked by the keeper before calling `execute_order`. |
 | **Acceptable price** | The worst execution price a trader will accept for a market order. Orders revert if the execution price exceeds this bound. |
 | **Min collateral factor** | A market-level parameter (stored in `data_store`) that defines the minimum collateral-to-size ratio below which a position is liquidatable. Example: 0.01 means a position is liquidatable when remaining collateral falls below 1 % of its USD size. |
+| **Max open interest (OI cap)** | A per-market, per-side limit on total notional USD open interest. Stored under `max_open_interest_key(market, is_long)`. Any position increase that would push OI beyond this cap reverts. A cap of 0 means uncapped. |
+| **Keeper execution window** | The time gap between when a user creates a pending order and when a keeper executes it. Keepers control timing within this window; the `acceptable_price` field is the user's primary defence against adverse timing. |
 | **Realised PnL** | PnL that has been settled to the trader's account upon a decrease or liquidation. Distinct from unrealised PnL, which is the mark-to-market gain/loss on an open position. |
 | **Oracle** | The `oracle` contract that stores keeper-submitted, ed25519-verified price pairs (min/max) for each token. Prices are ledger-scoped — keepers must submit fresh prices each time they call an execution function. |
 | **Instance storage** | Soroban storage bucket for small, frequently-accessed values (admin address, contract addresses). Subject to TTL rent — the protocol bumps TTL on every interaction. |

@@ -45,6 +45,29 @@ pub fn mul_div_wide(env: &Env, a: i128, b: i128, denominator: i128) -> i128 {
     result.to_i128().unwrap_or(if a > 0 { i128::MAX } else { i128::MIN })
 }
 
+/// (a × b) / denominator rounded UP (ceiling division) using I256.
+/// Used for fee and cost amounts so the protocol never under-collects.
+pub fn mul_div_wide_up(env: &Env, a: i128, b: i128, denominator: i128) -> i128 {
+    if denominator == 0 {
+        return 0;
+    }
+    let a256 = I256::from_i128(env, a);
+    let b256 = I256::from_i128(env, b);
+    let d256 = I256::from_i128(env, denominator);
+    let product = a256.mul(&b256);
+    // ceiling division: (product + denominator - 1) / denominator
+    // only applies when product > 0 to avoid rounding negative values upward
+    let zero = I256::from_i128(env, 0);
+    let one  = I256::from_i128(env, 1);
+    let result = if product.cmp(&zero) > 0 {
+        let d_minus_one = d256.sub(&one);
+        product.add(&d_minus_one).div(&d256)
+    } else {
+        product.div(&d256)
+    };
+    result.to_i128().unwrap_or(if a > 0 { i128::MAX } else { i128::MIN })
+}
+
 // ─── Factor helpers ───────────────────────────────────────────────────────────
 
 /// value / total expressed as a FLOAT_PRECISION fraction.
@@ -230,5 +253,69 @@ mod tests {
         let two = 2 * fp;
         let four = 4 * fp;
         assert_eq!(pow_factor(&env, two, 2 * fp), four);
+    }
+
+    // ── Issue #156/#127: rounding direction ──────────────────────────────────
+
+    /// mul_div_wide (floor) and mul_div_wide_up (ceil) produce the same result
+    /// when the division is exact.
+    #[test]
+    fn rounding_exact_division_same_result() {
+        let env = Env::default();
+        // 10 × 3 / 5 = 6 exactly — both should give 6
+        assert_eq!(mul_div_wide(&env, 10, 3, 5), 6);
+        assert_eq!(mul_div_wide_up(&env, 10, 3, 5), 6);
+    }
+
+    /// When division has a remainder, mul_div_wide_up produces a result one
+    /// greater than mul_div_wide, ensuring fees are never under-collected.
+    #[test]
+    fn rounding_up_exceeds_floor_on_remainder() {
+        let env = Env::default();
+        // 10 × 1 / 3 = 3 remainder 1 → floor = 3, ceil = 4
+        let floor = mul_div_wide(&env, 10, 1, 3);
+        let ceil  = mul_div_wide_up(&env, 10, 1, 3);
+        assert_eq!(floor, 3);
+        assert_eq!(ceil,  4);
+        assert!(ceil > floor, "ceil must exceed floor when there is a remainder");
+    }
+
+    /// Repeated small fees accumulate rather than leak when rounding up.
+    /// 1_000_001 iterations each paying 1 stroop of fee at 0.001% rate —
+    /// the ceiling version must collect at least as much as the floor version.
+    #[test]
+    fn fee_rounding_accumulates_not_leaks() {
+        let env = Env::default();
+        let fp = FLOAT_PRECISION;
+        // fee_factor = 0.001% = fp / 100_000
+        let fee_factor = fp / 100_000;
+        let size = 33; // odd number ensures a remainder on most iterations
+
+        let mut floor_total: i128 = 0;
+        let mut ceil_total:  i128 = 0;
+
+        for _ in 0..1_000 {
+            floor_total += mul_div_wide(&env, size, fee_factor, fp);
+            ceil_total  += mul_div_wide_up(&env, size, fee_factor, fp);
+        }
+
+        assert!(
+            ceil_total >= floor_total,
+            "ceiling-rounded fees must accumulate at least as much as floor-rounded fees"
+        );
+    }
+
+    /// Negative values (credits/claimable amounts) should not be rounded away
+    /// from zero — mul_div_wide_up returns floor division for negative products.
+    #[test]
+    fn rounding_up_does_not_affect_negative_values() {
+        let env = Env::default();
+        // −10 × 1 / 3 = −3 remainder −1 → both floor and ceil behave the same
+        // (we only apply ceiling for positive fee amounts)
+        let floor = mul_div_wide(&env, -10, 1, 3);
+        let ceil  = mul_div_wide_up(&env, -10, 1, 3);
+        // Both should truncate toward zero (i.e. -3, not -4)
+        assert_eq!(floor, -3);
+        assert_eq!(ceil,  -3);
     }
 }

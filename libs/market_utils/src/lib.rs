@@ -615,4 +615,91 @@ mod tests {
         // No max configured → always passes
         assert!(validate_pool_amount(&env, &ds, &market, &lt).is_ok());
     }
+
+    // ── Issue #155/#126: validate_open_interest unit tests ────────────────────
+
+    /// When no MAX_OPEN_INTEREST is configured (key absent / 0), any OI is valid.
+    #[test]
+    fn validate_open_interest_unconfigured_always_ok() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = make_market(&env);
+        let market = make_market_props(&mt, &it, &lt, &st);
+
+        // Seed arbitrarily large OI with no cap set
+        let oi_key = gmx_keys::open_interest_key(&env, &mt, &lt, true);
+        DsClient::new(&env, &ds).apply_delta_to_u128(&admin, &oi_key, &(999_000 * FLOAT_PRECISION));
+
+        assert!(
+            validate_open_interest(&env, &ds, &market, true).is_ok(),
+            "unconfigured cap must always pass"
+        );
+    }
+
+    /// When OI is exactly at the cap, validation passes.
+    #[test]
+    fn validate_open_interest_at_cap_passes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = make_market(&env);
+        let market = make_market_props(&mt, &it, &lt, &st);
+
+        let cap: u128 = (5_000 * FLOAT_PRECISION) as u128;
+        let ds_c = DsClient::new(&env, &ds);
+        ds_c.set_u128(&admin, &gmx_keys::max_open_interest_key(&env, &mt, true), &cap);
+
+        // Set OI exactly equal to cap (via long_token collateral)
+        let oi_key = gmx_keys::open_interest_key(&env, &mt, &lt, true);
+        ds_c.apply_delta_to_u128(&admin, &oi_key, &(cap as i128));
+
+        assert!(
+            validate_open_interest(&env, &ds, &market, true).is_ok(),
+            "OI exactly at cap must pass"
+        );
+    }
+
+    /// When OI exceeds the cap by even 1 unit, validation returns an error.
+    #[test]
+    fn validate_open_interest_over_cap_fails() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = make_market(&env);
+        let market = make_market_props(&mt, &it, &lt, &st);
+
+        let cap: u128 = (3_000 * FLOAT_PRECISION) as u128;
+        let ds_c = DsClient::new(&env, &ds);
+        ds_c.set_u128(&admin, &gmx_keys::max_open_interest_key(&env, &mt, true), &cap);
+
+        // Set OI one unit above cap
+        let oi_key = gmx_keys::open_interest_key(&env, &mt, &lt, true);
+        ds_c.apply_delta_to_u128(&admin, &oi_key, &(cap as i128 + 1));
+
+        assert_eq!(
+            validate_open_interest(&env, &ds, &market, true),
+            Err(Error::MaxOpenInterestExceeded),
+            "OI one unit over cap must return MaxOpenInterestExceeded"
+        );
+    }
+
+    /// Cap is per-side: long cap does not affect short OI validation.
+    #[test]
+    fn validate_open_interest_cap_is_per_side() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, ds, mt, it, lt, st) = make_market(&env);
+        let market = make_market_props(&mt, &it, &lt, &st);
+
+        let long_cap: u128 = (1_000 * FLOAT_PRECISION) as u128;
+        let ds_c = DsClient::new(&env, &ds);
+        ds_c.set_u128(&admin, &gmx_keys::max_open_interest_key(&env, &mt, true), &long_cap);
+
+        // Push shorts well above the long cap — should still pass (no short cap)
+        let short_oi_key = gmx_keys::open_interest_key(&env, &mt, &st, false);
+        ds_c.apply_delta_to_u128(&admin, &short_oi_key, &(10_000 * FLOAT_PRECISION));
+
+        assert!(
+            validate_open_interest(&env, &ds, &market, false).is_ok(),
+            "long cap must not affect short-side validation"
+        );
+    }
 }

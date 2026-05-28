@@ -434,4 +434,108 @@ mod tests {
         client.mint(&admin, &user, &100_0000i128);
         client.transfer(&user, &other, &200_0000i128); // should panic
     }
+
+    // ── Issue #153/#124: mint/burn access-control tests ───────────────────────
+
+    /// A caller without CONTROLLER role must not be able to mint LP tokens.
+    #[test]
+    #[should_panic]
+    fn unauthorized_mint_reverts() {
+        let (env, _admin, rs_id, mt_id) = setup();
+        let attacker = Address::generate(&env);
+        let victim   = Address::generate(&env);
+
+        // attacker has no role at all
+        let rs = RsClient::new(&env, &rs_id);
+        assert!(!rs.has_role(&attacker, &roles::controller(&env)));
+
+        let client = MarketTokenClient::new(&env, &mt_id);
+        // Must revert with Unauthorized
+        client.mint(&attacker, &victim, &1_000_000i128);
+    }
+
+    /// A caller without CONTROLLER role must not be able to call withdraw_from_pool.
+    /// This exercises the same require_controller guard used on the burn-equivalent path.
+    #[test]
+    #[should_panic]
+    fn unauthorized_withdraw_from_pool_reverts() {
+        let (env, admin, rs_id, mt_id) = setup();
+        let attacker = Address::generate(&env);
+        let victim   = Address::generate(&env);
+
+        // Mint some tokens so the contract holds a balance to attempt withdrawing.
+        // We use a real SEP-41 token registered in the env.
+        let pool_token = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let client = MarketTokenClient::new(&env, &mt_id);
+
+        // attacker has no CONTROLLER role
+        let rs = RsClient::new(&env, &rs_id);
+        assert!(!rs.has_role(&attacker, &roles::controller(&env)));
+
+        // Must revert with Unauthorized
+        client.withdraw_from_pool(&attacker, &pool_token, &victim, &1_000i128);
+    }
+
+    /// A caller WITH CONTROLLER role can mint and the balance is reflected correctly.
+    #[test]
+    fn authorized_mint_succeeds() {
+        let (env, admin, _, mt_id) = setup();
+        let user   = Address::generate(&env);
+        let client = MarketTokenClient::new(&env, &mt_id);
+
+        client.mint(&admin, &user, &5_000_0000i128);
+        assert_eq!(client.balance(&user), 5_000_0000, "balance must reflect minted amount");
+        assert_eq!(client.total_supply(), 5_000_0000, "total supply must grow by minted amount");
+    }
+
+    /// After mint + burn, total supply and balance return to zero.
+    #[test]
+    fn authorized_burn_reduces_supply() {
+        let (env, admin, _, mt_id) = setup();
+        let user   = Address::generate(&env);
+        let client = MarketTokenClient::new(&env, &mt_id);
+
+        client.mint(&admin, &user, &1_000_0000i128);
+        assert_eq!(client.total_supply(), 1_000_0000);
+
+        client.burn(&user, &1_000_0000i128);
+        assert_eq!(client.balance(&user), 0, "balance must be zero after full burn");
+        assert_eq!(client.total_supply(), 0, "total supply must be zero after full burn");
+    }
+
+    /// Role assignment at market creation: verifying that a role granted post-init
+    /// takes effect for mint (simulates deposit_handler being granted CONTROLLER).
+    #[test]
+    fn newly_granted_controller_can_mint() {
+        let (env, admin, rs_id, mt_id) = setup();
+        let handler = Address::generate(&env);
+        let user    = Address::generate(&env);
+
+        // Grant CONTROLLER to the handler after initialization
+        RsClient::new(&env, &rs_id).grant_role(&admin, &handler, &roles::controller(&env));
+
+        let client = MarketTokenClient::new(&env, &mt_id);
+        client.mint(&handler, &user, &250_0000i128);
+        assert_eq!(client.balance(&user), 250_0000);
+    }
+
+    /// Revoking CONTROLLER from an address prevents further mints.
+    #[test]
+    #[should_panic]
+    fn revoked_controller_cannot_mint() {
+        let (env, admin, rs_id, mt_id) = setup();
+        let handler = Address::generate(&env);
+        let user    = Address::generate(&env);
+
+        let rs = RsClient::new(&env, &rs_id);
+        rs.grant_role(&admin, &handler, &roles::controller(&env));
+
+        let client = MarketTokenClient::new(&env, &mt_id);
+        // First mint succeeds
+        client.mint(&handler, &user, &100_0000i128);
+
+        // Revoke and attempt again — must revert
+        rs.revoke_role(&admin, &handler, &roles::controller(&env));
+        client.mint(&handler, &user, &100_0000i128);
+    }
 }
