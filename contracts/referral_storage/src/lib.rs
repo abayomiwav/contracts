@@ -219,82 +219,261 @@ mod tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Env};
 
-    fn setup() -> (Env, Address, ReferralStorageClient<'static>) {
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    struct World {
+        env:     Env,
+        admin:   Address,
+        handler: Address,
+    }
+
+    fn setup() -> World {
         let env = Env::default();
         env.mock_all_auths();
-        let admin = Address::generate(&env);
-        let contract_id = env.register(ReferralStorage, ());
-        let client = ReferralStorageClient::new(&env, &contract_id);
-        client.initialize(&admin);
-        (env, admin, client)
+        let admin   = Address::generate(&env);
+        let handler = env.register(ReferralStorage, ());
+        ReferralStorageClient::new(&env, &handler).initialize(&admin);
+        World { env, admin, handler }
+    }
+
+    fn client(w: &World) -> ReferralStorageClient {
+        ReferralStorageClient::new(&w.env, &w.handler)
     }
 
     fn make_code(env: &Env, seed: u8) -> BytesN<32> {
         BytesN::from_array(env, &[seed; 32])
     }
 
+    // ─── Issue #89: tier number bounds ───────────────────────────────────────
+
+    /// Tier 0, 1, 2 are all valid; no panic expected.
     #[test]
-    fn test_transfer_code_ownership_success() {
-        let (env, _admin, client) = setup();
-        let alice = Address::generate(&env);
-        let bob   = Address::generate(&env);
-        let code  = make_code(&env, 0x01);
-
-        client.register_code(&alice, &code);
-        assert_eq!(client.get_code_owner(&code), Some(alice.clone()));
-
-        client.transfer_code_ownership(&alice, &bob, &code);
-        assert_eq!(client.get_code_owner(&code), Some(bob));
+    fn set_referrer_tier_valid_tiers_accepted() {
+        let w = setup();
+        let referrer = Address::generate(&w.env);
+        for t in 0u32..=2 {
+            client(&w).set_referrer_tier(&w.admin, &referrer, &t);
+        }
     }
 
+    /// Tier 3 is out-of-range and must revert with InvalidTier.
+    #[test]
+    #[should_panic]
+    fn set_referrer_tier_tier_3_reverts() {
+        let w = setup();
+        let referrer = Address::generate(&w.env);
+        client(&w).set_referrer_tier(&w.admin, &referrer, &3u32);
+    }
+
+    /// Tier 100 is far out-of-range and must revert.
+    #[test]
+    #[should_panic]
+    fn set_referrer_tier_tier_100_reverts() {
+        let w = setup();
+        let referrer = Address::generate(&w.env);
+        client(&w).set_referrer_tier(&w.admin, &referrer, &100u32);
+    }
+
+    /// set_tier_config with tier > 2 must revert.
+    #[test]
+    #[should_panic]
+    fn set_tier_config_invalid_tier_reverts() {
+        let w = setup();
+        let cfg = TierConfig { total_rebate_bps: 500, discount_share_bps: 5000 };
+        client(&w).set_tier_config(&w.admin, &3u32, &cfg);
+    }
+
+    // ─── Issue #89: rebate bps bounds ────────────────────────────────────────
+
+    /// total_rebate_bps == 10_000 is the maximum; must be accepted.
+    #[test]
+    fn set_tier_config_max_rebate_bps_accepted() {
+        let w = setup();
+        let cfg = TierConfig { total_rebate_bps: 10_000, discount_share_bps: 0 };
+        client(&w).set_tier_config(&w.admin, &0u32, &cfg);
+    }
+
+    /// total_rebate_bps > 10_000 must revert with InvalidInput.
+    #[test]
+    #[should_panic]
+    fn set_tier_config_rebate_bps_overflow_reverts() {
+        let w = setup();
+        let cfg = TierConfig { total_rebate_bps: 10_001, discount_share_bps: 0 };
+        client(&w).set_tier_config(&w.admin, &0u32, &cfg);
+    }
+
+    /// discount_share_bps == 10_000 is the maximum; must be accepted.
+    #[test]
+    fn set_tier_config_max_discount_share_bps_accepted() {
+        let w = setup();
+        let cfg = TierConfig { total_rebate_bps: 0, discount_share_bps: 10_000 };
+        client(&w).set_tier_config(&w.admin, &0u32, &cfg);
+    }
+
+    /// discount_share_bps > 10_000 must revert with InvalidInput.
+    #[test]
+    #[should_panic]
+    fn set_tier_config_discount_share_bps_overflow_reverts() {
+        let w = setup();
+        let cfg = TierConfig { total_rebate_bps: 0, discount_share_bps: 10_001 };
+        client(&w).set_tier_config(&w.admin, &0u32, &cfg);
+    }
+
+    /// Both fields at maximum must be accepted (10_000, 10_000).
+    #[test]
+    fn set_tier_config_both_at_max_accepted() {
+        let w = setup();
+        let cfg = TierConfig { total_rebate_bps: 10_000, discount_share_bps: 10_000 };
+        client(&w).set_tier_config(&w.admin, &1u32, &cfg);
+    }
+
+    // ─── Issue #89: valid configs persist and are readable ───────────────────
+
+    /// A written tier config is readable back with identical values.
+    #[test]
+    fn set_tier_config_persists_and_is_readable_via_discount_bps() {
+        let w = setup();
+        // Set tier 1: 20% total_rebate, 50% discount_share → 10% net discount.
+        let cfg = TierConfig { total_rebate_bps: 2_000, discount_share_bps: 5_000 };
+        client(&w).set_tier_config(&w.admin, &1u32, &cfg);
+
+        // Wire up a code → referrer → tier 1 path so get_trader_discount_bps resolves it.
+        let referrer = Address::generate(&w.env);
+        let code = BytesN::from_array(&w.env, &[7u8; 32]);
+        let trader  = Address::generate(&w.env);
+        client(&w).register_code(&referrer, &code);
+        client(&w).set_referrer_tier(&w.admin, &referrer, &1u32);
+        client(&w).set_trader_referral_code(&trader, &code);
+
+        let discount = client(&w).get_trader_discount_bps(&trader);
+        // Expected: 2_000 * 5_000 / 10_000 = 1_000 bps
+        assert_eq!(discount, 1_000, "net discount must equal total_rebate * discount_share / 10_000");
+    }
+
+    /// get_trader_discount_bps returns 0 when the tier has no configured TierConfig.
+    #[test]
+    fn get_trader_discount_bps_returns_zero_for_unconfigured_tier() {
+        let w = setup();
+        let referrer = Address::generate(&w.env);
+        let code = BytesN::from_array(&w.env, &[9u8; 32]);
+        let trader  = Address::generate(&w.env);
+        client(&w).register_code(&referrer, &code);
+        // Assign tier 2 but do NOT configure TierConfig for tier 2.
+        client(&w).set_referrer_tier(&w.admin, &referrer, &2u32);
+        client(&w).set_trader_referral_code(&trader, &code);
+
+        let discount = client(&w).get_trader_discount_bps(&trader);
+        assert_eq!(discount, 0, "discount must be 0 when TierConfig is absent");
+    }
+
+    /// get_trader_discount_bps returns 0 when the trader has no referral code.
+    #[test]
+    fn get_trader_discount_bps_no_code_returns_zero() {
+        let w = setup();
+        let trader = Address::generate(&w.env);
+        assert_eq!(client(&w).get_trader_discount_bps(&trader), 0);
+    }
+
+    /// Tier 0 with zero bps config returns 0 discount (not a panic).
+    #[test]
+    fn set_tier_config_zero_bps_valid_returns_zero_discount() {
+        let w = setup();
+        let cfg = TierConfig { total_rebate_bps: 0, discount_share_bps: 0 };
+        client(&w).set_tier_config(&w.admin, &0u32, &cfg);
+
+        let referrer = Address::generate(&w.env);
+        let code = BytesN::from_array(&w.env, &[5u8; 32]);
+        let trader  = Address::generate(&w.env);
+        client(&w).register_code(&referrer, &code);
+        client(&w).set_referrer_tier(&w.admin, &referrer, &0u32);
+        client(&w).set_trader_referral_code(&trader, &code);
+
+        assert_eq!(client(&w).get_trader_discount_bps(&trader), 0);
+    }
+
+    // ─── Issue #89: non-admin cannot mutate tier state ───────────────────────
+
+    /// Only the stored admin can call set_tier_config — impostor must revert.
+    #[test]
+    #[should_panic]
+    fn set_tier_config_non_admin_reverts() {
+        let w = setup();
+        let impostor = Address::generate(&w.env);
+        let cfg = TierConfig { total_rebate_bps: 100, discount_share_bps: 100 };
+        // Bypass mock_all_auths by not passing the real admin.
+        ReferralStorageClient::new(&w.env, &w.handler)
+            .set_tier_config(&impostor, &0u32, &cfg);
+    }
+
+    // ─── Issue #88: code ownership transfer ──────────────────────────────────
+
+    /// Successful transfer: new owner is stored, old owner removed.
+    #[test]
+    fn test_transfer_code_ownership_success() {
+        let w = setup();
+        let alice = Address::generate(&w.env);
+        let bob   = Address::generate(&w.env);
+        let code  = make_code(&w.env, 0x01);
+
+        client(&w).register_code(&alice, &code);
+        assert_eq!(client(&w).get_code_owner(&code), Some(alice.clone()));
+
+        client(&w).transfer_code_ownership(&alice, &bob, &code);
+        assert_eq!(client(&w).get_code_owner(&code), Some(bob));
+    }
+
+    /// Non-owner attempting transfer must revert with NotCodeOwner.
     #[test]
     fn test_transfer_code_ownership_non_owner_rejected() {
-        let (env, _admin, client) = setup();
-        let alice   = Address::generate(&env);
-        let charlie = Address::generate(&env);
-        let code    = make_code(&env, 0x02);
+        let w = setup();
+        let alice   = Address::generate(&w.env);
+        let charlie = Address::generate(&w.env);
+        let code    = make_code(&w.env, 0x02);
 
-        client.register_code(&alice, &code);
+        client(&w).register_code(&alice, &code);
 
-        let result = client.try_transfer_code_ownership(&charlie, &alice, &code);
+        let result = client(&w).try_transfer_code_ownership(&charlie, &alice, &code);
         assert_eq!(result, Err(Ok(Error::NotCodeOwner)));
     }
 
+    /// Transfer on an unregistered code must revert with CodeNotFound.
     #[test]
     fn test_transfer_code_ownership_missing_code_rejected() {
-        let (env, _admin, client) = setup();
-        let alice = Address::generate(&env);
-        let bob   = Address::generate(&env);
-        let code  = make_code(&env, 0x03);
+        let w = setup();
+        let alice = Address::generate(&w.env);
+        let bob   = Address::generate(&w.env);
+        let code  = make_code(&w.env, 0x03);
 
-        let result = client.try_transfer_code_ownership(&alice, &bob, &code);
+        let result = client(&w).try_transfer_code_ownership(&alice, &bob, &code);
         assert_eq!(result, Err(Ok(Error::CodeNotFound)));
     }
 
+    /// get_code_owner returns None for an unregistered code.
     #[test]
     fn test_get_code_owner_returns_none_for_unregistered() {
-        let (env, _admin, client) = setup();
-        let code = make_code(&env, 0x04);
-        assert_eq!(client.get_code_owner(&code), None);
+        let w = setup();
+        let code = make_code(&w.env, 0x04);
+        assert_eq!(client(&w).get_code_owner(&code), None);
     }
 
+    /// After a transfer, discount calculation uses the new owner's tier.
     #[test]
     fn test_trader_discount_follows_new_owner_tier() {
-        let (env, admin, client) = setup();
-        let alice = Address::generate(&env);
-        let bob   = Address::generate(&env);
-        let trader = Address::generate(&env);
-        let code  = make_code(&env, 0x05);
+        let w = setup();
+        let alice  = Address::generate(&w.env);
+        let bob    = Address::generate(&w.env);
+        let trader = Address::generate(&w.env);
+        let code   = make_code(&w.env, 0x05);
 
-        client.set_tier_config(&admin, &0, &TierConfig { total_rebate_bps: 1000, discount_share_bps: 5000 });
-        client.set_tier_config(&admin, &1, &TierConfig { total_rebate_bps: 2000, discount_share_bps: 5000 });
+        client(&w).set_tier_config(&w.admin, &0, &TierConfig { total_rebate_bps: 1000, discount_share_bps: 5000 });
+        client(&w).set_tier_config(&w.admin, &1, &TierConfig { total_rebate_bps: 2000, discount_share_bps: 5000 });
 
-        client.register_code(&alice, &code);
-        client.set_trader_referral_code(&trader, &code);
+        client(&w).register_code(&alice, &code);
+        client(&w).set_trader_referral_code(&trader, &code);
 
         // After transfer, discount should reflect bob's tier (default 0)
-        client.transfer_code_ownership(&alice, &bob, &code);
-        let discount = client.get_trader_discount_bps(&trader);
+        client(&w).transfer_code_ownership(&alice, &bob, &code);
+        let discount = client(&w).get_trader_discount_bps(&trader);
         // tier 0 for bob: 1000 * 5000 / 10_000 = 500
         assert_eq!(discount, 500);
     }
