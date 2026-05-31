@@ -6,6 +6,9 @@ version = 4
 name = "adl-handler"
 version = "0.1.0"
 dependencies = [
+ "data-store",
+ "deposit-handler",
+ "deposit-vault",
  "gmx-decrease-position-utils",
  "gmx-keys",
  "gmx-market-utils",
@@ -13,6 +16,11 @@ dependencies = [
  "gmx-position-utils",
  "gmx-pricing-utils",
  "gmx-types",
+ "market-token",
+ "oracle",
+ "order-handler",
+ "order-vault",
+ "role-store",
  "soroban-sdk",
 ]
 
