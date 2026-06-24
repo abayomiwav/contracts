@@ -726,6 +726,23 @@ pub fn global_pause_key(env: &Env) -> BytesN<32> {
     sha256(env, &b)
 }
 
+/// The max allowed percentage price movement (e.g. 500 = 5%) before the circuit
+/// breaker pauses the market (issue #203). Stored in FLOAT_PRECISION in data_store.
+pub fn circuit_breaker_factor_key(env: &Env, market: &Address) -> BytesN<32> {
+    let mut b = Bytes::new(env);
+    push_str(&mut b, env, "CIRCUIT_BREAKER_FACTOR");
+    push_addr(&mut b, env, market);
+    sha256(env, &b)
+}
+
+/// Stores whether a specific market is paused (issue #203). Stored as a bool in data_store.
+pub fn is_market_paused_key(env: &Env, market: &Address) -> BytesN<32> {
+    let mut b = Bytes::new(env);
+    push_str(&mut b, env, "IS_MARKET_PAUSED");
+    push_addr(&mut b, env, market);
+    sha256(env, &b)
+}
+
 // ─── Fee tier keys (issue #204) ───────────────────────────────────────────────
 
 /// Volume threshold (USD, FLOAT_PRECISION) required to qualify for fee tier N.

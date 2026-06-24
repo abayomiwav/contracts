@@ -25,7 +25,7 @@ use gmx_keys::{
     max_leverage_key, order_key, order_list_key, position_fee_factor_key, position_key,
     fee_tier_position_fee_factor_key, fee_tier_volume_threshold_key,
     trader_volume_key, trader_volume_window_start_key,
-    roles, DEFAULT_KEEPER_HEARTBEAT_TIMEOUT,
+    roles, DEFAULT_KEEPER_HEARTBEAT_TIMEOUT, is_market_paused_key,
 };
 use gmx_math::{mul_div_wide, FLOAT_PRECISION};
 use gmx_swap_utils::swap_with_path;
@@ -77,6 +77,8 @@ pub enum Error {
     MaxLeverageExceeded = 13,
     /// `create_orders` received more than 5 orders in a single batch.
     BatchSizeLimitExceeded = 14,
+    /// The target market is paused due to circuit breaker (issue #203).
+    MarketPaused = 15,
 }
 
 
@@ -154,6 +156,7 @@ trait IDataStore {
     fn remove_bytes32_from_set(env: Env, caller: Address, set_key: BytesN<32>, value: BytesN<32>);
     fn contains_bytes32(env: Env, set_key: BytesN<32>, value: BytesN<32>) -> bool;
     fn set_address(env: Env, caller: Address, key: BytesN<32>, value: Address) -> Address;
+    fn get_bool(env: Env, key: BytesN<32>) -> bool;
 }
 
 #[allow(dead_code)]
@@ -528,6 +531,10 @@ impl OrderHandler {
         let handler = env.current_contract_address();
         let ds = DataStoreClient::new(&env, &data_store);
 
+        if ds.get_bool(&is_market_paused_key(&env, &params.market)) {
+            panic_with_error!(&env, Error::MarketPaused);
+        }
+
         // Determine whether this order type requires upfront collateral in the vault.
         // Increase and swap orders pull from the vault; decrease orders do not deposit.
         let is_increase_or_swap = matches!(
@@ -650,6 +657,11 @@ impl OrderHandler {
             .unwrap_or(false);
         if is_frozen {
             panic_with_error!(&env, Error::OrderFrozen);
+        }
+
+        let ds = DataStoreClient::new(&env, &data_store);
+        if ds.get_bool(&is_market_paused_key(&env, &order.market)) {
+            panic_with_error!(&env, Error::MarketPaused);
         }
 
         // Load market props
@@ -1350,6 +1362,7 @@ mod tests {
     use deposit_vault::{DepositVault, DepositVaultClient as DVClient};
     use gmx_keys::{position_key, roles};
     use gmx_types::TokenPrice;
+    use soroban_sdk::testutils::Ledger as _;
     use market_token::{MarketToken, MarketTokenClient as MtClient};
     use oracle::{Oracle, OracleClient as OClient};
     use order_vault::{OrderVault, OrderVaultClient as OVClient};

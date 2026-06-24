@@ -22,7 +22,7 @@ use gmx_pricing_utils::{get_execution_price, get_position_price_impact};
 use gmx_types::{
     AdlCandidate, DepositProps, FundingInfo, FundingRateInfo, KeeperHeartbeatStatus, MarketProps,
     OrderProps, PoolValueInfo, PositionFees, PositionInfo, PositionLeverage, PositionProps,
-    PriceProps, ProtocolStats, SwapEstimate, WithdrawalProps,
+    PriceProps, ProtocolStats, SwapEstimate, WithdrawalProps, PendingOrder,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
@@ -586,6 +586,54 @@ impl Reader {
             }
         }
         out
+    }
+
+    /// Return paginated pending orders for a given market.
+    pub fn get_pending_orders(
+        env: Env,
+        data_store: Address,
+        order_handler: Address,
+        market: Address,
+        offset: u32,
+        limit: u32,
+    ) -> Vec<PendingOrder> {
+        let ds = DataStoreClient::new(&env, &data_store);
+        let set_key = order_list_key(&env);
+        let total_count = ds.get_bytes32_set_count(&set_key);
+        
+        let mut matching_orders = Vec::new(&env);
+        let mut skipped = 0;
+        
+        let keys = ds.get_bytes32_set_at(&set_key, &0, &total_count);
+        let oh_client = OrderHandlerClient::new(&env, &order_handler);
+        
+        for i in 0..keys.len() {
+            let k = keys.get_unchecked(i);
+            if let Some(order) = oh_client.get_order(&k) {
+                if order.market == market {
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    
+                    matching_orders.push_back(PendingOrder {
+                        owner: order.account,
+                        market: order.market.clone(),
+                        order_type: order.order_type,
+                        size_delta_usd: order.size_delta_usd,
+                        execution_fee: order.execution_fee,
+                        updated_at_time: order.updated_at_time,
+                        is_long: order.is_long,
+                    });
+                    
+                    if matching_orders.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        
+        matching_orders
     }
 
     /// Get position info by canonical position key (BytesN<32>), returning enriched `PositionInfo`.

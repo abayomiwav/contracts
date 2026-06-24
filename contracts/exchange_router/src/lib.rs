@@ -13,7 +13,7 @@
 #![no_std]
 #![allow(dependency_on_unit_never_type_fallback)]
 
-use gmx_keys::global_pause_key;
+use gmx_keys::{global_pause_key, is_market_paused_key};
 use gmx_types::{CreateDepositParams, CreateOrderParams, CreateWithdrawalParams};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
@@ -228,6 +228,25 @@ impl ExchangeRouter {
             &env.current_contract_address(),
             &global_pause_key(&env),
             &paused,
+        );
+    }
+
+    pub fn reset_circuit_breaker(env: Env, market: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::Admin)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+        admin.require_auth();
+        let data_store: Address = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::DataStore)
+            .unwrap();
+        DataStoreClient::new(&env, &data_store).set_bool(
+            &env.current_contract_address(),
+            &is_market_paused_key(&env, &market),
+            &false,
         );
     }
 

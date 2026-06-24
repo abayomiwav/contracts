@@ -106,6 +106,7 @@ pub struct PositionProps {
 
 /// Mirrors GMX's Order.OrderType.
 #[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OrderType {
     MarketSwap,
     LimitSwap,
@@ -350,6 +351,22 @@ pub struct PositionLeverage {
     pub net_collateral_usd: u128,
     pub position_size_usd: u128,
     pub is_liquidatable: bool,
+}
+
+/// Lightweight pending-order summary returned by reader::get_pending_orders (issue #202).
+///
+/// Carries only the fields a keeper bot needs to decide execution order:
+/// owner, type, size, fee, last-update time, and direction.
+/// Full details can always be fetched via reader::get_order if needed.
+#[contracttype]
+pub struct PendingOrder {
+    pub owner: Address,
+    pub market: Address,
+    pub order_type: OrderType,
+    pub size_delta_usd: i128,
+    pub execution_fee: i128,
+    pub updated_at_time: u64,
+    pub is_long: bool,
 }
 
 use soroban_sdk::BytesN;
