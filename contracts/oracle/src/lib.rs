@@ -720,4 +720,79 @@ mod tests {
         assert_eq!(client.get_primary_price(&btc).min, 60_000 * 10i128.pow(30));
         assert_eq!(client.get_primary_price(&usdc).min, 10i128.pow(30));
     }
+
+    // ── Issue #292: signer rotation ───────────────────────────────────────────
+
+    fn register_keeper_pubkey(env: &Env, ds: &Address, admin: &Address, index: u32, pubkey: &BytesN<32>) {
+        let mut buf = Bytes::new(env);
+        let prefix = keeper_public_key_prefix(env);
+        buf.extend_from_array(&prefix.to_array());
+        buf.extend_from_array(&index.to_be_bytes());
+        let key: BytesN<32> = env.crypto().sha256(&buf).into();
+        DsClient::new(env, ds).set_bytes32(admin, &key, pubkey);
+    }
+
+    /// rotate_signer replaces the stored pubkey so get_keeper_pubkey returns the new key.
+    #[test]
+    fn rotate_signer_updates_stored_pubkey() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _rs, ds, oracle_id) = setup(&env);
+        let client = OracleClient::new(&env, &oracle_id);
+
+        let pubkey_a = BytesN::from_array(&env, &[0xAA; 32]);
+        let pubkey_b = BytesN::from_array(&env, &[0xBB; 32]);
+
+        // Register keeper A at index 0
+        register_keeper_pubkey(&env, &ds, &admin, 0, &pubkey_a);
+        assert_eq!(get_keeper_pubkey(&env, &ds, 0), pubkey_a);
+
+        // Rotate to keeper B
+        client.rotate_signer(&admin, &0u32, &pubkey_b);
+
+        // data_store must now return B
+        assert_eq!(get_keeper_pubkey(&env, &ds, 0), pubkey_b);
+    }
+
+    /// rotate_signer emits OracleSignerRotated with correct old and new signer fields.
+    #[test]
+    fn rotate_signer_emits_event_with_old_and_new_signer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _rs, ds, oracle_id) = setup(&env);
+        let client = OracleClient::new(&env, &oracle_id);
+
+        let pubkey_a = BytesN::from_array(&env, &[0x11; 32]);
+        let pubkey_b = BytesN::from_array(&env, &[0x22; 32]);
+        register_keeper_pubkey(&env, &ds, &admin, 1, &pubkey_a);
+
+        client.rotate_signer(&admin, &1u32, &pubkey_b);
+
+        let events = env.events().all();
+        let rotation_event = events
+            .iter()
+            .find(|(_, topics, _)| topics.contains(&soroban_sdk::Val::from(symbol_short!("sig_rot"))))
+            .expect("sig_rot event must be emitted");
+        let payload: OracleSignerRotated = soroban_sdk::FromVal::from_val(&env, &rotation_event.2);
+        assert_eq!(payload.keeper_index, 1);
+        assert_eq!(payload.old_signer, pubkey_a);
+        assert_eq!(payload.new_signer, pubkey_b);
+    }
+
+    /// rotate_signer called by a non-admin must panic with Unauthorized.
+    #[test]
+    #[should_panic]
+    fn rotate_signer_rejects_non_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _rs, ds, oracle_id) = setup(&env);
+        let client = OracleClient::new(&env, &oracle_id);
+
+        let pubkey_a = BytesN::from_array(&env, &[0xAA; 32]);
+        register_keeper_pubkey(&env, &ds, &admin, 0, &pubkey_a);
+
+        // Use a different address as caller — must be rejected
+        let non_admin = Address::generate(&env);
+        client.rotate_signer(&non_admin, &0u32, &BytesN::from_array(&env, &[0xBB; 32]));
+    }
 }
