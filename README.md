@@ -575,6 +575,7 @@ A `Makefile` is provided for the most common workflows.
 | `make check` | Type-check without producing wasm (`cargo check`) |
 | `make lint` | Run Clippy with warnings as errors |
 | `make test` | Run the full Soroban sandbox test suite |
+| `make testnet-smoke` | Create and execute a small testnet deposit and verify GM tokens were minted |
 | `make deploy-all` | Deploy the full protocol graph to **testnet** (default) |
 | `make deploy-contract` | Deploy one standalone contract Wasm for debugging |
 | `make upgrade-contract` | Upload new Wasm and upgrade one existing deployed contract |
@@ -641,6 +642,11 @@ echo $EXCHANGE_ROUTER
 ---
 
 ## Testnet Market Bootstrap
+
+For the current end-to-end operator procedure, including signed-oracle setup,
+exact initialization arguments, and the deposit smoke test, follow
+[`docs/deployment.md`](docs/deployment.md). The commands below are a shorter
+reference and may omit production oracle details.
 
 After the protocol contracts are deployed, you need to create a market, grant keeper roles, set config parameters, and seed initial liquidity before the protocol is usable. `scripts/bootstrap.sh` automates all of these steps.
 
