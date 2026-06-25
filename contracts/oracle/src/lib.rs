@@ -101,6 +101,7 @@ trait IDataStore {
     fn get_address_set_count(env: Env, set_key: BytesN<32>) -> u32;
     fn get_address_set_at(env: Env, set_key: BytesN<32>, start: u32, end: u32) -> Vec<Address>;
     fn set_bool(env: Env, caller: Address, key: BytesN<32>, value: bool) -> bool;
+    fn set_bytes32(env: Env, caller: Address, key: BytesN<32>, value: BytesN<32>);
 }
 
 #[contracttype]
@@ -110,6 +111,13 @@ pub struct CircuitBreakerTripped {
     pub old_price: i128,
     pub new_price: i128,
     pub deviation_bps: u128,
+}
+
+#[contracttype]
+pub struct OracleSignerRotated {
+    pub keeper_index: u32,
+    pub old_signer: BytesN<32>,
+    pub new_signer: BytesN<32>,
 }
 
 // ─── Contract ─────────────────────────────────────────────────────────────────
@@ -430,35 +438,35 @@ fn build_price_message(
 fn check_circuit_breaker(env: &Env, data_store: &Address, token: &Address, new_min: i128, new_max: i128) {
     let price_key = TempKey::Price(token.clone());
     let prev_price_opt = env.storage().temporary().get::<TempKey, PriceProps>(&price_key);
-    
+
     if let Some(prev_price) = prev_price_opt {
         let last_price = prev_price.mid_price();
         let new_price = (new_min + new_max) / 2;
         if last_price > 0 {
             let deviation_val = (new_price - last_price).abs();
             let deviation_bps = ((deviation_val as u128) * 10000) / (last_price as u128);
-            
+
             let ds = DataStoreClient::new(env, data_store);
             let market_list_k = gmx_keys::market_list_key(env);
             let market_count = ds.get_address_set_count(&market_list_k);
             let markets = ds.get_address_set_at(&market_list_k, &0, &market_count);
-            
+
             for i in 0..markets.len() {
                 let market = markets.get(i).unwrap();
                 let index_token = ds.get_address(&gmx_keys::market_index_token_key(env, &market));
                 let long_token = ds.get_address(&gmx_keys::market_long_token_key(env, &market));
                 let short_token = ds.get_address(&gmx_keys::market_short_token_key(env, &market));
-                
+
                 let matches_market = (index_token.is_some() && index_token.unwrap() == *token)
                     || (long_token.is_some() && long_token.unwrap() == *token)
                     || (short_token.is_some() && short_token.unwrap() == *token);
-                    
+
                 if matches_market {
                     let threshold = ds.get_u128(&gmx_keys::circuit_breaker_factor_key(env, &market));
                     if threshold > 0 && deviation_bps > threshold {
                         // Set market pause flag to true
                         ds.set_bool(&env.current_contract_address(), &gmx_keys::is_market_paused_key(env, &market), &true);
-                        
+
                         // Emit event
                         env.events().publish(
                             (soroban_sdk::symbol_short!("cb_trip"),),
