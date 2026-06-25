@@ -318,6 +318,38 @@ impl Oracle {
             env.storage().temporary().remove(&TempKey::Price(token));
         }
     }
+
+    // ── Signer rotation ───────────────────────────────────────────────────────
+
+    /// Atomically replace a keeper's ed25519 public key in data_store.
+    ///
+    /// Reads the current key at `keeper_index`, writes `new_pubkey` in its place,
+    /// and emits `OracleSignerRotated`. Any price bundle signed by the old key
+    /// that has not yet been submitted will be rejected once the key is replaced.
+    /// Requires the caller to be the contract admin.
+    pub fn rotate_signer(env: Env, caller: Address, keeper_index: u32, new_pubkey: BytesN<32>) {
+        caller.require_auth();
+        require_admin(&env, &caller);
+
+        let data_store: Address = env
+            .storage()
+            .instance()
+            .get(&InstanceKey::DataStore)
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotInitialized));
+
+        let key = keeper_pubkey_storage_key(&env, keeper_index);
+        let old_pubkey = DataStoreClient::new(&env, &data_store).get_bytes32(&key);
+        DataStoreClient::new(&env, &data_store).set_bytes32(&caller, &key, &new_pubkey);
+
+        env.events().publish(
+            (symbol_short!("sig_rot"),),
+            OracleSignerRotated {
+                keeper_index,
+                old_signer: old_pubkey,
+                new_signer: new_pubkey,
+            },
+        );
+    }
 }
 
 // ─── Test-only price submission ────────────────────────────────────────────────
@@ -390,19 +422,34 @@ fn require_order_keeper(env: &Env, caller: &Address) {
     }
 }
 
+fn require_admin(env: &Env, caller: &Address) {
+    let admin: Address = env
+        .storage()
+        .instance()
+        .get(&InstanceKey::Admin)
+        .unwrap_or_else(|| panic_with_error!(env, Error::NotInitialized));
+    if *caller != admin {
+        panic_with_error!(env, Error::Unauthorized);
+    }
+}
+
+/// Compute the data_store key for a keeper public key slot by index.
+fn keeper_pubkey_storage_key(env: &Env, index: u32) -> BytesN<32> {
+    let mut buf = Bytes::new(env);
+    let prefix = keeper_public_key_prefix(env);
+    buf.extend_from_array(&prefix.to_array());
+    buf.extend_from_array(&index.to_be_bytes());
+    env.crypto().sha256(&buf).into()
+}
+
 /// Retrieve ed25519 public key for a keeper by index from data_store.
 ///
 /// Keys are stored as 32 bytes at key = sha256("KEEPER_PUBLIC_KEY" ‖ index_u32_BE).
 /// We pack two consecutive BytesN<32> to form the full 32-byte ed25519 pubkey.
 /// For simplicity we store the key at (prefix ‖ index) and read 32 bytes.
 fn get_keeper_pubkey(env: &Env, data_store: &Address, index: u32) -> BytesN<32> {
-    let mut buf = Bytes::new(env);
-    let prefix = keeper_public_key_prefix(env);
-    buf.extend_from_array(&prefix.to_array());
-    buf.extend_from_array(&index.to_be_bytes());
-    let key = env.crypto().sha256(&buf).into();
-    let client = DataStoreClient::new(env, data_store);
-    client.get_bytes32(&key)
+    let key = keeper_pubkey_storage_key(env, index);
+    DataStoreClient::new(env, data_store).get_bytes32(&key)
 }
 
 /// Build the canonical message that keepers sign.
