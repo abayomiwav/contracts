@@ -16,6 +16,9 @@ oracle = { path = "../contracts/oracle" }
 order-handler = { path = "../contracts/order_handler" }
 order-vault = { path = "../contracts/order_vault" }
 deposit-vault = { path = "../contracts/deposit_vault" }
+deposit-handler = { path = "../contracts/deposit_handler" }
+withdrawal-handler = { path = "../contracts/withdrawal_handler" }
+withdrawal-vault = { path = "../contracts/withdrawal_vault" }
 liquidation-handler = { path = "../contracts/liquidation_handler" }
 adl-handler = { path = "../contracts/adl_handler" }
 fee-handler = { path = "../contracts/fee_handler" }
@@ -40,3 +43,7 @@ path = "role_access_control.rs"
 [[test]]
 name = "take_profit"
 path = "take_profit.rs"
+
+[[test]]
+name = "lifecycle_long"
+path = "lifecycle_long.rs"
