@@ -11,10 +11,11 @@ members = [
   "libs/swap_utils",
   "libs/increase_position_utils",
   "libs/decrease_position_utils",
+  "tests",
 ]
 
 [workspace.dependencies]
-soroban-sdk = "25"
+soroban-sdk = "25.3.1"
 
 [profile.release]
 opt-level = "z"
