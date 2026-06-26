@@ -306,14 +306,12 @@ impl WithdrawalHandler {
         );
         mt_client.burn(&handler, &lp_amount);
 
+        // CEI fix (#295): delete the withdrawal record before any pool transfer so that
+        // a re-entrant callback on the receiving contract cannot replay this execution.
+        remove_withdrawal(&env, &data_store, &handler, &key, &withdrawal.account);
+
         // Transfer pool tokens from market_token contract → receiver
         if long_out > 0 {
-            mt_client.withdraw_from_pool(
-                &handler,
-                &market.long_token,
-                &withdrawal.receiver,
-                &long_out,
-            );
             apply_delta_to_pool_amount(
                 &env,
                 &data_store,
@@ -322,14 +320,14 @@ impl WithdrawalHandler {
                 &market.long_token,
                 -long_out,
             );
-        }
-        if short_out > 0 {
             mt_client.withdraw_from_pool(
                 &handler,
-                &market.short_token,
+                &market.long_token,
                 &withdrawal.receiver,
-                &short_out,
+                &long_out,
             );
+        }
+        if short_out > 0 {
             apply_delta_to_pool_amount(
                 &env,
                 &data_store,
@@ -338,9 +336,13 @@ impl WithdrawalHandler {
                 &market.short_token,
                 -short_out,
             );
+            mt_client.withdraw_from_pool(
+                &handler,
+                &market.short_token,
+                &withdrawal.receiver,
+                &short_out,
+            );
         }
-
-        remove_withdrawal(&env, &data_store, &handler, &key, &withdrawal.account);
 
         env.events().publish(
             (symbol_short!("wth_exe"),),

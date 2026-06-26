@@ -59,21 +59,17 @@ Soroban cross-contract calls are **synchronous** and **part of the same ledger t
 | 3 | Check output ≥ minimums | Validation |
 | 4 | `vault.transfer_out` LP tokens → handler | External transfer |
 | 5 | `market_token.burn` LP from handler | External state write |
-| 6 | `market_token.withdraw_from_pool` (long) → receiver | External transfer |
+| 6 | **`remove_withdrawal`** (delete record + index sets) | **State write (CEI fix #295)** |
 | 7 | `apply_delta_to_pool_amount` (long, negative) | State write |
-| 8 | `market_token.withdraw_from_pool` (short) → receiver | External transfer |
+| 8 | `market_token.withdraw_from_pool` (long) → receiver | External transfer |
 | 9 | `apply_delta_to_pool_amount` (short, negative) | State write |
-| 10 | `remove_withdrawal` | State write |
+| 10 | `market_token.withdraw_from_pool` (short) → receiver | External transfer |
 
-**Finding:** Steps 6–9 interleave pool transfers with pool amount state writes (not strict CEI). Cleanup (step 10) occurs after all external calls.
+**Fix applied (issue #295):** `remove_withdrawal` is now called at step 6, immediately after the LP burn and before any pool transfer to the receiver. A re-entrant callback on the receiving contract will find the withdrawal record gone and panic with `WithdrawalNotFound`, completely closing the re-entry window.
 
-**Mitigation in place:**
-- LP tokens are **burned** at step 5 before any pool transfer. A re-entrant `execute_withdrawal` with the same key would find zero total LP supply delta (burn already applied), causing the pro-rata calculation to yield zero output amounts — no tokens transferred.
-- The withdrawal record still exists during steps 6–9; however, the burned LP supply makes re-entry economically zero-sum.
+Pool amount state updates (`apply_delta_to_pool_amount`) are also reordered to precede their corresponding `withdraw_from_pool` calls, ensuring all DataStore state is consistent before each external transfer.
 
-**Risk:** LOW. The burn-before-transfer ordering is the key invariant. A re-entrant attacker using the same withdrawal key cannot extract additional tokens because the supply has already been reduced.
-
-**Recommendation:** Move `remove_withdrawal` (step 10) before steps 6–9 to fully close the re-entry window.
+**Risk:** NONE — record deleted and pool amounts updated before any tokens leave the pool.
 
 ---
 
@@ -163,7 +159,7 @@ Delegates to `order_handler::liquidate_position` after health check. No direct t
 | Handler | CEI compliant? | Risk | Key mitigation |
 |---------|---------------|------|----------------|
 | `deposit_handler::execute_deposit` | Partial | Low | Vault balance guard prevents double-spend |
-| `withdrawal_handler::execute_withdrawal` | Partial | Low | LP burn before pool transfer |
+| `withdrawal_handler::execute_withdrawal` | ✅ Fixed (#295) | None | Record deleted + pool amounts updated before any transfer |
 | `order_handler::execute_order` (increase) | Partial | Low | Keeper-gated; collateral pre-snapshotted |
 | `order_handler::execute_order` (decrease) | Partial | Low | Position state reduced before PnL transfer |
 | `order_handler::execute_order` (swap) | Partial | Low | Duplicate market guard; oracle pre-fetched |
@@ -172,7 +168,6 @@ Delegates to `order_handler::liquidate_position` after health check. No direct t
 
 ## Outstanding recommendations
 
-1. **`withdrawal_handler::execute_withdrawal`** — move `remove_withdrawal` before pool transfers to fully close the re-entry window. This is the highest-priority ordering fix.
-2. **`deposit_handler::execute_deposit`** — consider moving `remove_deposit` before vault transfers once the ledger-entry budget allows it.
-3. **All handlers** — add an explicit reentrancy guard (`Executing` flag in instance storage) as additional defence when budget permits. Set the flag at function entry; clear at exit.
-4. **Ongoing** — any new handler added to the protocol must be reviewed against this document before merging.
+1. **`deposit_handler::execute_deposit`** — consider moving `remove_deposit` before vault transfers once the ledger-entry budget allows it.
+2. **All handlers** — add an explicit reentrancy guard (`Executing` flag in instance storage) as additional defence when budget permits. Set the flag at function entry; clear at exit.
+3. **Ongoing** — any new handler added to the protocol must be reviewed against this document before merging.
