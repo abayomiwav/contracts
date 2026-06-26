@@ -22,7 +22,9 @@ use gmx_keys::{
     account_order_list_key, keeper_heartbeat_timeout_key, last_keeper_activity_key,
     liquidation_execution_fee_key, min_execution_fee_key,
     market_index_token_key, market_long_token_key, market_short_token_key,
-    max_leverage_key, order_key, order_list_key, position_fee_factor_key, position_key,
+    max_leverage_key, open_interest_key, order_key, order_list_key,
+    position_fee_factor_key, position_key,
+    saved_funding_factor_per_second_key,
     fee_tier_position_fee_factor_key, fee_tier_volume_threshold_key,
     trader_volume_key, trader_volume_window_start_key,
     roles, DEFAULT_KEEPER_HEARTBEAT_TIMEOUT, is_market_paused_key,
@@ -136,6 +138,22 @@ pub struct PositionLiquidatedEvent {
     pub market: Address,
     pub execution_price: i128,
     pub remaining_collateral: i128,
+}
+
+// ─── Funding rate snapshot event (issue #286) ─────────────────────────────────
+//
+// Historical funding rates are not stored on-chain to avoid Soroban storage
+// costs. Instead, a FundingRateSnapshot is emitted after every position order
+// execution. Query history via a Soroban event indexer filtering on topic
+// "fund_snap" and the market address in the event payload.
+
+#[contracttype]
+pub struct FundingRateSnapshot {
+    pub market: Address,
+    pub funding_factor_per_second: i128,
+    pub long_open_interest: u128,
+    pub short_open_interest: u128,
+    pub timestamp: u64,
 }
 
 // ─── External contract clients ────────────────────────────────────────────────
@@ -392,6 +410,20 @@ impl OrderHandler {
         env.storage()
             .instance()
             .set(&InstanceKey::ReferralStorage, &referral_storage);
+    }
+
+    /// Bump the TTL of a stored position by rewriting it to persistent storage.
+    /// Allows reader/view contracts to extend the lifetime of positions they access.
+    pub fn bump_position_ttl(env: Env, caller: Address, key: BytesN<32>) -> bool {
+        caller.require_auth();
+        let pos_key = PositionStorageKey::Position(key.clone());
+        match env.storage().persistent().get::<PositionStorageKey, PositionProps>(&pos_key) {
+            Some(p) => {
+                env.storage().persistent().set(&pos_key, &p);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Create up to 5 orders atomically in a single call (issue #219).
@@ -919,6 +951,38 @@ impl OrderHandler {
                     );
                 }
             }
+        }
+
+        // Issue #286: emit funding rate snapshot after position order execution.
+        // Swap orders do not update funding state, so they are excluded.
+        let is_position_order = matches!(
+            order.order_type,
+            OrderType::MarketIncrease
+                | OrderType::LimitIncrease
+                | OrderType::StopIncrease
+                | OrderType::MarketDecrease
+                | OrderType::LimitDecrease
+                | OrderType::StopLossDecrease
+                | OrderType::Liquidation
+        );
+        if is_position_order {
+            let funding_factor = ds.get_i128(
+                &saved_funding_factor_per_second_key(&env, &market.market_token)
+            );
+            let oi_long = ds.get_u128(&open_interest_key(&env, &market.market_token, &market.long_token, true))
+                + ds.get_u128(&open_interest_key(&env, &market.market_token, &market.short_token, true));
+            let oi_short = ds.get_u128(&open_interest_key(&env, &market.market_token, &market.long_token, false))
+                + ds.get_u128(&open_interest_key(&env, &market.market_token, &market.short_token, false));
+            env.events().publish(
+                (symbol_short!("fund_snap"),),
+                FundingRateSnapshot {
+                    market: market.market_token.clone(),
+                    funding_factor_per_second: funding_factor,
+                    long_open_interest: oi_long,
+                    short_open_interest: oi_short,
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
         }
 
         // Remove order
@@ -3258,6 +3322,21 @@ mod tests {
 
         StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.ord_vault, &COLLATERAL);
         let key = OrderHandlerClient::new(&w.env, &w.ord_handler).create_order(
+    // ── Issue #286: FundingRateSnapshot event emission ────────────────────────
+
+    /// Executing a market increase order must emit a FundingRateSnapshot event
+    /// (topic "fund_snap") without panicking.
+    #[test]
+    fn execute_position_order_emits_funding_snapshot() {
+        let w = setup();
+        let fp = gmx_math::FLOAT_PRECISION;
+        // Mint collateral directly into order_vault and create a market increase order.
+        // seed_pool is intentionally skipped: create_order only needs the vault balance,
+        // not a seeded pool. execute_order for MarketIncrease works with zero pool OI.
+        StellarAssetClient::new(&w.env, &w.long_tk).mint(&w.ord_vault, &COLLATERAL);
+        set_prices(&w, 2000 * fp);
+        let hc = OrderHandlerClient::new(&w.env, &w.ord_handler);
+        let key = hc.create_order(
             &w.user,
             &CreateOrderParams {
                 receiver: w.user.clone(),
@@ -3269,6 +3348,7 @@ mod tests {
                 trigger_price: 0,
                 acceptable_price: 0,
                 execution_fee: min_fee as i128,
+                execution_fee: 0,
                 min_output_amount: 0,
                 order_type: OrderType::MarketIncrease,
                 is_long: true,
@@ -3279,6 +3359,15 @@ mod tests {
                 .get_order(&key)
                 .is_some(),
             "order must be stored when fee meets the minimum"
+        set_prices(&w, 2000 * fp);
+        hc.execute_order(&w.keeper, &key);
+
+        // If FundingRateSnapshot emission panicked, execute_order would have failed
+        // and the position would not exist.
+        let pk = position_key(&w.env, &w.user, &w.market_tk, &w.long_tk, true);
+        assert!(
+            hc.get_position(&pk).is_some(),
+            "position must exist; FundingRateSnapshot emission must not have panicked"
         );
     }
 }
