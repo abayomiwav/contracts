@@ -33,6 +33,18 @@ use gmx_decrease_position_utils::{DecreasePositionParams, decrease_position};
 use gmx_swap_utils::swap_with_path;
 use gmx_types::PositionProps;
 
+// ─── TTL constants (#297) ─────────────────────────────────────────────────────
+//
+// Lazy bump: extend_ttl only fires when the remaining TTL falls below
+// MIN_BUMP_THRESHOLD.  Both values are in ledger sequences; at 5 s/ledger:
+//   PERSISTENT_BUMP_TARGET ≈ 30 days   (518 400 ledgers)
+//   MIN_BUMP_THRESHOLD     ≈ 15 days   (259 200 ledgers)
+//
+// Only extend when current TTL < MIN_BUMP_THRESHOLD; target PERSISTENT_BUMP_TARGET.
+// This halves unnecessary rent payments on busy markets (issue #297).
+const PERSISTENT_BUMP_TARGET: u32 = 518_400;
+const MIN_BUMP_THRESHOLD: u32 = 259_200;
+
 // ─── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -74,6 +86,8 @@ trait IRoleStore {
 #[soroban_sdk::contractclient(name = "DataStoreClient")]
 trait IDataStore {
     fn get_u128(env: Env, key: BytesN<32>) -> u128;
+    /// Cache-first read for rarely-changing market config (issue #299).
+    fn get_u128_cached(env: Env, key: BytesN<32>) -> u128;
     fn increment_nonce(env: Env, caller: Address) -> u64;
     fn get_address(env: Env, key: BytesN<32>) -> Option<Address>;
     fn add_bytes32_to_set(env: Env, caller: Address, set_key: BytesN<32>, value: BytesN<32>);
@@ -187,6 +201,11 @@ impl OrderHandler {
         };
 
         env.storage().persistent().set(&OrderStorageKey::Order(key.clone()), &order);
+        env.storage().persistent().extend_ttl(
+            &OrderStorageKey::Order(key.clone()),
+            MIN_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_TARGET,
+        );
 
         ds.add_bytes32_to_set(&handler, &order_list_key(&env), &key);
         ds.add_bytes32_to_set(&handler, &account_order_list_key(&env, &caller), &key);
@@ -382,6 +401,11 @@ impl OrderHandler {
         order.updated_at_time   = env.ledger().timestamp();
 
         env.storage().persistent().set(&OrderStorageKey::Order(key.clone()), &order);
+        env.storage().persistent().extend_ttl(
+            &OrderStorageKey::Order(key.clone()),
+            MIN_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_TARGET,
+        );
 
         // Clear frozen flag if set (order is being updated = re-enabled)
         env.storage().persistent().remove(&OrderStorageKey::OrderFrozen(key.clone()));
@@ -399,6 +423,11 @@ impl OrderHandler {
             .unwrap_or_else(|| panic_with_error!(&env, Error::OrderNotFound));
 
         env.storage().persistent().set(&OrderStorageKey::OrderFrozen(key.clone()), &true);
+        env.storage().persistent().extend_ttl(
+            &OrderStorageKey::OrderFrozen(key.clone()),
+            MIN_BUMP_THRESHOLD,
+            PERSISTENT_BUMP_TARGET,
+        );
 
         env.events().publish((symbol_short!("ord_frz"),), key);
     }
