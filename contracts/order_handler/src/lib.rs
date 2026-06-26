@@ -22,13 +22,14 @@ use gmx_keys::{
     account_order_list_key, keeper_heartbeat_timeout_key, last_keeper_activity_key,
     liquidation_execution_fee_key,
     market_index_token_key, market_long_token_key, market_short_token_key,
-    max_leverage_key, order_key, order_list_key, position_fee_factor_key, position_key,
+    max_leverage_key, max_swap_path_length_key, order_key, order_list_key,
+    position_fee_factor_key, position_key,
     fee_tier_position_fee_factor_key, fee_tier_volume_threshold_key,
     trader_volume_key, trader_volume_window_start_key,
     roles, DEFAULT_KEEPER_HEARTBEAT_TIMEOUT, is_market_paused_key,
 };
 use gmx_math::{mul_div_wide, FLOAT_PRECISION};
-use gmx_swap_utils::swap_with_path;
+use gmx_swap_utils::{swap_with_path, MAX_SWAP_PATH_LENGTH};
 pub use gmx_types::CreateOrderParams;
 use gmx_types::PositionProps;
 use gmx_types::{MarketProps, OrderProps, OrderType, PriceProps};
@@ -81,6 +82,8 @@ pub enum Error {
     MarketPaused = 15,
     /// swap_path contains a repeated market address — would corrupt pool accounting (issue #232).
     CyclicSwapPath = 16,
+    /// swap_path exceeds the maximum allowed number of hops (issue #300).
+    SwapPathTooLong = 17,
 }
 
 
@@ -426,9 +429,18 @@ impl OrderHandler {
         let mut keys: soroban_sdk::Vec<BytesN<32>> = soroban_sdk::Vec::new(&env);
 
         let len = requests.len();
+        // Issue #300: read max path length once for the entire batch.
+        let raw_max = ds.get_u128(&gmx_keys::max_swap_path_length_key(&env)) as usize;
+        let max_swap_len = if raw_max == 0 { MAX_SWAP_PATH_LENGTH } else { raw_max };
+
         let mut i = 0u32;
         while i < len {
             let params = requests.get_unchecked(i);
+
+            // Issue #300: enforce max path length at creation time.
+            if params.swap_path.len() as usize > max_swap_len {
+                panic_with_error!(&env, Error::SwapPathTooLong);
+            }
 
             let is_increase_or_swap = matches!(
                 params.order_type,
@@ -542,6 +554,14 @@ impl OrderHandler {
         {
             let path = &params.swap_path;
             let path_len = path.len();
+
+            // Issue #300: enforce max path length at creation time.
+            let raw_max = ds.get_u128(&gmx_keys::max_swap_path_length_key(&env)) as usize;
+            let max_len = if raw_max == 0 { MAX_SWAP_PATH_LENGTH } else { raw_max };
+            if path_len as usize > max_len {
+                panic_with_error!(&env, Error::SwapPathTooLong);
+            }
+
             let mut i = 0u32;
             while i < path_len {
                 let mut j = i + 1;
