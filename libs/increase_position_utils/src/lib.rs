@@ -12,11 +12,11 @@
 #![no_std]
 #![allow(dependency_on_unit_never_type_fallback)]
 
-use gmx_keys::{account_position_list_key, position_key, position_list_key};
+use gmx_keys::{account_position_list_key, pool_amount_key, position_fee_factor_key, position_key, position_list_key};
 use gmx_market_utils::{
     apply_delta_to_open_interest, apply_delta_to_open_interest_in_tokens,
 };
-use gmx_math::{mul_div_wide, TOKEN_PRECISION};
+use gmx_math::{mul_div_wide, FLOAT_PRECISION, TOKEN_PRECISION};
 use gmx_pricing_utils::get_execution_price;
 use gmx_types::{MarketProps, PositionProps, PriceProps};
 use soroban_sdk::{contracttype, Address, BytesN, Env};
@@ -132,13 +132,30 @@ pub fn increase_position(env: &Env, p: &IncreasePositionParams) -> PositionProps
         0
     };
 
-    // NOTE: position fees, borrowing/funding tracker syncs, collateral sum, fee pool writes,
-    // and validate_position are omitted to stay within Soroban's 40 ledger-entry budget.
-    // For the first positions on an empty market these are all zero/no-op. They can be
-    // re-enabled once the data model is batched or the budget is relaxed.
-
-    // Update collateral (no fee deduction for now)
-    position.collateral_amount += p.collateral_amount;
+    // Compute position fee using the maker (positive impact) or taker (negative impact) rate
+    let ds = DataStoreClient::new(env, p.data_store);
+    let fee_key = position_fee_factor_key(env, &p.market.market_token, p.for_positive_impact);
+    let fee_factor = ds.get_u128(&fee_key) as i128;
+    let fee_usd = if fee_factor > 0 {
+        mul_div_wide(env, p.size_delta_usd, fee_factor, FLOAT_PRECISION)
+    } else {
+        0
+    };
+    let fee_tokens = if p.collateral_price > 0 && fee_usd > 0 {
+        mul_div_wide(env, fee_usd, TOKEN_PRECISION, p.collateral_price)
+    } else {
+        0
+    };
+    let net_collateral = if p.collateral_amount > fee_tokens {
+        p.collateral_amount - fee_tokens
+    } else {
+        0
+    };
+    if fee_tokens > 0 {
+        let pool_key = pool_amount_key(env, &p.market.market_token, p.collateral_token);
+        ds.apply_delta_to_u128(p.caller, &pool_key, fee_tokens);
+    }
+    position.collateral_amount += net_collateral;
 
     // Update position size
     position.size_in_usd += p.size_delta_usd;
@@ -170,9 +187,9 @@ pub fn increase_position(env: &Env, p: &IncreasePositionParams) -> PositionProps
 
     // If brand-new position, add to the tracking sets
     if is_new {
-        let ds = DataStoreClient::new(env, p.data_store);
-        ds.add_bytes32_to_set(p.caller, &position_list_key(env), &pos_key);
-        ds.add_bytes32_to_set(
+        let ds2 = DataStoreClient::new(env, p.data_store);
+        ds2.add_bytes32_to_set(p.caller, &position_list_key(env), &pos_key);
+        ds2.add_bytes32_to_set(
             p.caller,
             &account_position_list_key(env, p.account),
             &pos_key,
